@@ -1,0 +1,14 @@
+.venv/
+.venv-*/
+qt_app/.venv-linux/
+qt_app/.venv-windows/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+logs/
+*.log
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,8 @@
+PyQt6>=6.7,<7
+Flask>=2.2,<4
+Werkzeug>=2.2,<4
+carm>=0.1.20260819
+numpy==1.26.4
+scipy==1.11.4
+websocket-client>=1.6,<2
+zeroconf>=0.130,<1

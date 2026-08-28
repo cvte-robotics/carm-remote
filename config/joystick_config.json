@@ -1,0 +1,47 @@
+{
+  "quest_pose_jump": {
+    "position_threshold_m": 0.05,
+    "rotation_threshold_deg": 20.0
+  },
+  "single_arm": {
+    "gripper_tau": 25,
+    "init_joint": [
+      -0.000192,
+      1.56713,
+      -0.956551,
+      0.018883,
+      0.907339,
+      -0.004005
+    ]
+  },
+  "dual_arm": {
+    "left": {
+      "gripper_tau": 25,
+      "init_joint": {
+        "six_axis": [
+          -0.000192,
+          1.56713,
+          -0.956551,
+          0.018883,
+          0.907339,
+          -0.004005
+        ],
+        "seven_axis": [0, 0, 0, -1.57, 0, 0, 0]
+      }
+    },
+    "right": {
+      "gripper_tau": 25,
+      "init_joint": {
+        "six_axis": [
+          -0.000192,
+          1.56713,
+          -0.956551,
+          0.018883,
+          0.907339,
+          -0.004005
+        ],
+        "seven_axis": [0, 0, 0, -1.57, 0, 0, 0]
+      }
+    }
+  }
+}
