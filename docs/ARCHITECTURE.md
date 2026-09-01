@@ -23,7 +23,8 @@ flowchart LR
     Receiver --> Module[QuestInputModule]
     Module --> Controller[JoystickController]
     Controller --> Session[ArmSession]
-    Session --> Command[CommandController]
+    Session --> Transaction[ControlTransaction]
+    Transaction --> Command[CommandController]
     Command --> Carm[Carm SDK]
     Carm --> Arm[机械臂]
 ```
@@ -38,6 +39,9 @@ flowchart LR
 | 后端组合 | `server/desktop/app.py`、`runtime.py` | 创建 Flask 服务、注入唯一 controller、机械臂探测、心跳和进程级清理 |
 | API 适配 | `server/api/joystick_routes.py` | 把 HTTP/SSE 请求映射到 controller |
 | 会话主体 | `server/basic/joystick/session/controller.py` | 输入会话、共享状态、SSE 快照、机械臂会话和停止编排 |
+| 实时事务 | `server/basic/joystick/session/control_transaction.py` | 单个 ArmRuntime 的输入采样、策略门禁、物理派发和终止回报 |
+| 清理事务 | `server/basic/joystick/session/cleanup.py` | 冻结清理身份、编排 arm/provider 清理并保留失败 owner 供重试 |
+| 状态投影 | `server/basic/joystick/session/observation.py` | 生成不可变 Host 快照，并分别投影 HTTP 和 SSE 兼容载荷 |
 | 输入注册 | `server/basic/joystick/sources/registry.py` | 设备扫描身份、source lease 和模块生命周期 |
 | Quest 适配 | `include/quest/` | ADB 扫描、TCP 协议、输入解析、重连和资源回收 |
 | 机械臂会话 | `server/basic/joystick/session/arm.py` | 单臂/双臂 binding、初始化、控制线程和停止 |
@@ -63,11 +67,13 @@ flowchart LR
 
 `preflight.py` 检查 Python 依赖、Carm 包版本、ADB 命令、端口 `1999` 和 `9999`、运行所需文件以及 Quest 模块导入。
 
-`qt_app/main.py` 创建 `QApplication`、配置日志、再次执行启动检查，然后创建 `MainWindow`。`ViewModel.start()` 通过 `BackendProcess` 启动：
+`qt_app/main.py` 加载包内可用的末端实现，创建 `QApplication`、配置日志、再次执行启动检查，然后创建 `MainWindow`。`ViewModel.start()` 通过 `BackendProcess` 启动：
 
 ```text
-<当前虚拟环境 Python> -m server.desktop.app
+<当前虚拟环境 Python> -m server.desktop.app --end-effector <name>
 ```
+
+默认模式是 `carm`。Windows 包装器接受 `--end-effector` 和 `-EndEffector`，Linux 包装器原样转发 `--end-effector`。启动时会从 `server/basic/joystick/end_effectors/` 按名称动态加载包内实现；当前仓库提供 `carm`、`passthrough`，以及不控制硬件的 `blank` 开发示例。名称只受 Python 标识符格式约束；模块不存在或实现不符合末端合同时，启动会明确失败。
 
 后端启动后监听 `127.0.0.1:1999`。Qt 每 250 ms 请求一次 `/api/desktop/health`，返回的 `instance_token` 与本窗口生成的 token 相同时，才进入 `Idle` 状态并开始每秒 heartbeat。
 
@@ -119,6 +125,8 @@ sequenceDiagram
 - 两个 IP 相同时，master 使用 `arm_index=0`，slave 使用 `arm_index=1`，并选用七轴初始化配置。
 - master 绑定界面选择的手柄侧，slave 绑定另一侧。
 
+每个 ArmRuntime 在 Carm 连接准备完成后创建自己的末端 Driver。输入源、单/双臂和同/异板拓扑不决定末端实现：`carm` 等价封装原生 flange/gripper/hand，`passthrough` 将一个归一化 trigger 映射为六指相同目标，并依次发送六个 `mode=0` CAN-FD 帧。passthrough 不创建 worker、队列、去重或重试状态，也不把发送尝试解释为物理执行成功。
+
 ## 5. 数据流
 
 ### 5.1 命令流
@@ -145,7 +153,8 @@ Quest TCP 帧
   -> RawInputBatch（同一帧内的左右手数据）
   -> JoystickController
   -> QuestInputPolicy
-  -> 对应手柄绑定的 CommandController
+  -> 对应 ArmRuntime 的 ControlTransaction
+  -> CommandController 目标计算
 ```
 
 `QuestTcpReceiver` 接收换行分隔的 JSON 记录。连接必须先完成 protocol 2 的 `hello` / `hello_ack` 协商，之后才接收位姿帧和 heartbeat。
@@ -157,7 +166,8 @@ Quest TCP 帧
 ### 5.3 机械臂控制流
 
 ```text
-CommandController 输入快照
+ControlTransaction 输入快照与策略门禁
+  -> CommandController 目标计算
   -> 坐标变换与灵敏度
   -> 生成相对位姿目标
   -> 校验输入/控制/连接代际
@@ -166,7 +176,7 @@ CommandController 输入快照
   -> 当前机械臂连接
 ```
 
-每个机械臂对应一个 `CommandController` 和一个控制线程。控制循环频率由 `CONTROL_LOOP_HZ` 定义为 72 Hz。
+每个机械臂对应一个 `CommandController`、一个 `ControlTransaction` 和一个控制线程。`ControlTransaction` 拥有完整实时循环，频率由 `CONTROL_LOOP_HZ` 定义为 72 Hz；`CommandController` 负责目标计算和单臂操作，不拥有循环线程。
 
 控制代码中的主要手柄语义：
 
@@ -174,22 +184,24 @@ CommandController 输入快照
 |---|---|
 | Grip 大于 100 | 允许生成位姿目标；首次按下时同步机械臂反馈基准 |
 | 松开 Grip | 清除待发目标并等待下次重新同步 |
-| Trigger | 映射为 `0..0.08` 的末端开合位置 |
+| Trigger | 交给启动时选择的末端实现解释；`carm` 按 SDK 上下限插值，`passthrough` 映射为六个 `0..1000` 目标 |
 | A/X 且未按 Grip | 发送配置中的初始化关节位置 |
 | B/Y | 切换旋转锁定状态并重建映射基准 |
 
-末端类型在机械臂准备阶段读取：
+末端实现由启动参数选择，并在机械臂准备阶段创建：
 
-- `flange`：不发送末端命令。
-- `hand`：调用 `set_hand`。
-- `gripper`：调用 `set_gripper`。
-- 其他值或读取异常：按 `gripper` 处理。
+- `carm`：根据 Carm SDK 的末端配置执行原生末端控制；flange 或零自由度时不发送末端命令。
+- `passthrough`：将触发值映射为六指目标，依次发送六个 `mode=0` CAN-FD 帧。
+- 其他包内实现：由其 `EndEffectorBase` 子类负责参数校验和派发语义。
+
+末端实现不再由核心控制代码写死。新增实现放入 `server/basic/joystick/end_effectors/`，定义唯一的 `NAME` 和 `set_eff`，由启动时的包扫描发现。完整扩展合同与验证方法见 [新增末端控制方式](END_EFFECTOR_DEVELOPMENT.md)。
 
 ### 5.4 状态展示流
 
 ```text
 JoystickState
-  -> JoystickController.get_stream_snapshot()
+  -> JoystickController.get_observation_snapshot()
+  -> project_sse_payload()
   -> /api/joystick/events
   -> SseClient
   -> ViewModel._event()
@@ -234,6 +246,8 @@ running
 ```
 
 清理失败时进入 `retry_wait`，按 1 秒、2 秒、5 秒的间隔继续重试，后续保持 5 秒间隔。
+
+手动停止时，Qt 先关闭本地 SSE 订阅，再请求 `home` 清理。若后端因 Carm reader 或其他 owner 尚未释放而返回失败，界面保持 `Stopping`，使用同一 workflow generation 按 1 秒、2 秒、5 秒上限继续请求清理；只有后端确认全部 owner 已释放后才进入 `Idle`。
 
 Qt 每秒调用一次 `/api/desktop/heartbeat`。后端首次启动有 10 秒等待时间；收到 heartbeat 后，连续 3 秒未刷新会触发进程级 `hold` 清理。
 
@@ -287,7 +301,7 @@ Quest 连接由 `QuestInputModule.connect()` 完整管理：
 | `home` | 停止控制线程后，将机械臂移动到零关节位置，再断开 |
 | `hold` | 停止控制线程、清除目标并断开，不发送回零运动 |
 
-界面“停止手柄遥操”请求 `home`。如果输入已经断开，controller 会将 `home` 降级为 `hold`。窗口关闭请求 `hold`，桌面 heartbeat 超时和后端退出也固定执行 `hold`。
+界面“停止手柄遥操”先关闭本地 SSE 订阅，再请求 `home`。如果输入已经断开，controller 会将 `home` 降级为 `hold`。窗口关闭请求 `hold`，桌面 heartbeat 超时和后端退出也固定执行 `hold`。
 
 会话清理包含：
 
@@ -469,8 +483,7 @@ joystick_x, joystick_y, joystick_z, menu_capture, timestamp
 
 - `quest_pose_jump.position_threshold_m`
 - `quest_pose_jump.rotation_threshold_deg`
-- `single_arm.gripper_tau` 与六轴 `init_joint`
-- `dual_arm.left/right.gripper_tau`
+- `single_arm.init_joint`
 - 双臂左右侧的 `six_axis` 与 `seven_axis` 初始化关节
 
 数值与数组长度由 `JoystickConfigSnapshot` 校验。

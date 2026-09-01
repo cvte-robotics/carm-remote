@@ -91,6 +91,32 @@ Linux 启动脚本默认使用 `python3`。需要指定其他解释器时，可�
 PYTHON=/path/to/python3 ./run_linux.sh
 ```
 
+### 选择末端实现
+
+默认使用 Carm 原生末端控制：
+
+```text
+carm
+```
+
+使用 EtherCAT/CAN-FD 六指透传时，在启动时显式选择 `passthrough`。
+
+Windows：
+
+```powershell
+.\run_windows.ps1 --end-effector passthrough
+```
+
+PowerShell 风格的 `.\run_windows.ps1 -EndEffector passthrough` 也受支持。
+
+Linux：
+
+```bash
+./run_linux.sh --end-effector passthrough
+```
+
+末端名称按包内模块动态导入；名称必须是合法 Python 标识符格式，模块不存在或实现不符合末端合同时，启动会明确失败，不会静默回退。
+
 ### 只检查运行环境
 
 Windows：
@@ -123,8 +149,8 @@ Linux：
 运行配置位于 [config/joystick_config.json](config/joystick_config.json)，包括：
 
 - Quest 位姿变化阈值
-- 单臂初始化关节位置和夹爪力矩
-- 双臂左右侧的六轴、七轴初始化关节位置和夹爪力矩
+- 单臂初始化关节位置
+- 双臂左右侧的六轴、七轴初始化关节位置
 
 配置在后端启动时读取。修改后需要重新启动应用。
 
@@ -162,6 +188,7 @@ server/basic/joystick/      遥操会话、控制算法和输入注册
 
 - [整体架构、数据流与 API](docs/ARCHITECTURE.md)
 - [源码文件树与职责](docs/SOURCE_SNAPSHOT.md)
+- [新增末端控制方式](docs/END_EFFECTOR_DEVELOPMENT.md)
 
 ## 许可证
 

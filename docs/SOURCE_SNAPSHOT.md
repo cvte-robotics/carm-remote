@@ -16,6 +16,7 @@ carm_quest_desktop/
 │   └── joystick_config.json
 ├── docs/
 │   ├── ARCHITECTURE.md
+│   ├── END_EFFECTOR_DEVELOPMENT.md
 │   └── SOURCE_SNAPSHOT.md
 ├── include/
 │   ├── carm_teleop_input_contracts.py
@@ -29,6 +30,7 @@ carm_quest_desktop/
 │       ├── policy.py
 │       └── receiver.py
 ├── qt_app/
+│   ├── .gitignore
 │   ├── main.py
 │   ├── preflight.py
 │   ├── pyproject.toml
@@ -57,6 +59,11 @@ carm_quest_desktop/
     └── basic/
         └── joystick/
             ├── __init__.py
+            ├── end_effectors/
+            │   ├── __init__.py
+            │   ├── carm.py
+            │   ├── blank.py
+            │   └── passthrough.py
             ├── core/
             │   ├── __init__.py
             │   ├── command_controller.py
@@ -72,8 +79,11 @@ carm_quest_desktop/
             ├── session/
             │   ├── __init__.py
             │   ├── arm.py
+            │   ├── cleanup.py
             │   ├── constants.py
+            │   ├── control_transaction.py
             │   ├── controller.py
+            │   ├── observation.py
             │   └── state.py
             └── sources/
                 ├── __init__.py
@@ -96,8 +106,9 @@ carm_quest_desktop/
 
 | 文件 | 职责 |
 |---|---|
-| `config/joystick_config.json` | 保存 Quest 位姿跳变阈值、单臂/双臂初始化关节和夹爪力矩 |
+| `config/joystick_config.json` | 保存 Quest 位姿跳变阈值以及单臂/双臂初始化关节配置 |
 | `docs/ARCHITECTURE.md` | 记录整体架构、数据流、生命周期、控制链和 API |
+| `docs/END_EFFECTOR_DEVELOPMENT.md` | 记录新增末端实现的扩展合同、加载方式、调用语义和验证方法 |
 | `docs/SOURCE_SNAPSHOT.md` | 记录当前文件树和逐文件职责 |
 
 ## 4. Qt 桌面应用
@@ -166,7 +177,18 @@ MainWindow
 | `server/__init__.py` | 后端顶层 package 标记 |
 | `server/basic/joystick/__init__.py` | 组织运行路径、依赖、配置、Quest 常量、数据模型、会话与控制类的公开导出；提供 controller facade |
 
-### 6.2 `core/`
+### 6.2 `end_effectors/`
+
+| 文件 | 主要对象 | 职责 |
+|---|---|---|
+| `__init__.py` | `EndEffectorBase`、`EndEffectorContext`、加载和解析函数 | 定义末端合同、动态发现包内实现并提供统一构造入口 |
+| `blank.py` | `BlankEndEffector` | 提供不控制硬件的最小开发示例 |
+| `carm.py` | `CarmEndEffector` | 根据 Carm SDK 末端配置执行原生末端控制 |
+| `passthrough.py` | `PassthroughEndEffector` | 将触发值转换为六指 CAN-FD passthrough 帧 |
+
+末端实现通过启动参数选择，默认是 `carm`；当前仓库还提供 `passthrough` 和不控制硬件的 `blank` 开发示例。新增实现放入此目录并由启动时扫描发现，具体合同见 [新增末端控制方式](END_EFFECTOR_DEVELOPMENT.md)。
+
+### 6.3 `core/`
 
 | 文件 | 主要对象 | 职责 |
 |---|---|---|
@@ -174,11 +196,11 @@ MainWindow
 | `constants.py` | `CONTROL_LOOP_HZ` 等 | 定义 72 Hz 控制循环、末端控制速度和位姿分段阈值 |
 | `models.py` | `pose_to_dict`、`button_to_dict`、创建函数 | 在输入对象、兼容模型和 JSON 字典之间转换 |
 | `pose_math.py` | `project_input_to_arm`、`apply_pose_delta`、连续位姿差函数 | 完成坐标投影、四元数处理、缩放和相对位姿计算 |
-| `command_controller.py` | `CommandController` | 管理一个机械臂连接、反馈同步、初始化运动、目标计算、72 Hz 派发、末端命令和 home/stop |
+| `command_controller.py` | `CommandController` | 管理一个机械臂连接、反馈同步、初始化运动、目标计算和 home/stop 所需的机械臂操作 |
 
-`CommandController` 是实际产生机械臂命令的边界。它保存输入、控制和机械臂连接代际，并在派发前重新确认当前 WebSocket 身份和反馈新鲜度。
+`CommandController` 负责计算控制目标并封装单臂操作；会话层的 `ControlTransaction` 负责实时采样、策略门禁、物理派发和派发后的身份确认。
 
-### 6.3 `runtime/`
+### 6.4 `runtime/`
 
 | 文件 | 主要对象 | 职责 |
 |---|---|---|
@@ -188,15 +210,18 @@ MainWindow
 | `dependencies.py` | `Carm` adapter、依赖可用性标记 | 导入 NumPy、SciPy 和 Carm，并为 Carm 连接增加连接身份绑定的位姿派发 |
 | `paths.py` | 输入模块路径函数 | 选择输入模块根目录、设置 import path，并校验桌面运行使用的 Quest 模块来源 |
 
-### 6.4 `session/`
+### 6.5 `session/`
 
 | 文件 | 主要对象 | 职责 |
 |---|---|---|
 | `__init__.py` | 包标记 | joystick session package |
 | `constants.py` | 线程超时常量 | 定义控制线程和清理线程等待时间 |
 | `state.py` | `JoystickState` | 保存设备、输入、双手、机械臂、transport、控制代际和 SSE sequence 等共享状态 |
-| `arm.py` | `ArmRuntime`、`BaseArmSession`、`SingleArmSession`、`DualArmSession` | 创建 arm binding，初始化一个或两个 `CommandController`，启动控制线程并执行 stop/home |
-| `controller.py` | `JoystickController` | 遥操会话主控制器；拥有 source registry、状态、Quest 输入回调、机械臂 session、SSE 快照和清理流程 |
+| `arm.py` | `ArmRuntime`、`BaseArmSession` | 创建 arm binding，初始化一个或两个 `CommandController`，启动控制线程并执行 stop/home |
+| `control_transaction.py` | `ControlTransaction`、`LoopTermination` | 为一个 ArmRuntime 运行完整的 72 Hz 实时控制事务，执行采样、策略门禁、派发和终止回报 |
+| `cleanup.py` | `SessionCleanup`、`CleanupContext`、`CleanupResult` | 按固定上下文停止机械臂和输入源，失败时保留原 owner 供同一清理事务重试 |
+| `observation.py` | `ObservationSnapshot`、HTTP/SSE 投影函数 | 生成不可变 Host 状态快照，并分别投影为 HTTP 状态和 SSE 载荷 |
+| `controller.py` | `JoystickController` | 遥操会话主控制器；拥有 source registry、共享状态、机械臂 session、生命周期门禁和清理编排 |
 
 `JoystickController` 的主要责任链：
 
@@ -206,11 +231,11 @@ scan_devices
   -> set_session_config
   -> init_arm
   -> publish_input / publish_transport
-  -> get_stream_snapshot
+  -> get_observation_snapshot
   -> stop_session
 ```
 
-### 6.5 `sources/`
+### 6.6 `sources/`
 
 | 文件 | 主要对象 | 职责 |
 |---|---|---|
