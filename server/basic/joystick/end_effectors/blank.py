@@ -8,16 +8,15 @@ class BlankEndEffector(EndEffectorBase):
 
     def __init__(self, context: EndEffectorContext, **options) -> None:
         super().__init__(context, **options)
-        sender = getattr(self.carm, "set_blank", None)
-        if not callable(sender):
-            raise RuntimeError("current Carm SDK does not support blank control")
-        self._sender = sender
 
     def set_eff(self, trigger: int) -> bool:
+        ## 校验trigger值是否为数字类型且有限
         if isinstance(trigger, bool) or not isinstance(trigger, (int, float)):
             raise ValueError("blank trigger must be numeric")
         value = float(trigger)
         if not math.isfinite(value):
             raise ValueError("blank trigger must be finite")
-        ratio = max(0.0, min(value, 127.0)) / 127.0
-        return self._sender(ratio) is True
+
+        ## 这里可以添加自定义的处理逻辑，例如打印触发值等等
+        print("Blank end-effector received trigger:", value)
+        return True

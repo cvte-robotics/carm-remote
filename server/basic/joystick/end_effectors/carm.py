@@ -7,7 +7,7 @@ from . import EndEffectorBase, EndEffectorContext
 
 class CarmEndEffector(EndEffectorBase):
     NAME = "carm"
-    DEFAULT_TORQUE = 10.0
+    DEFAULT_TORQUE = 25.0
 
     def __init__(
         self,
