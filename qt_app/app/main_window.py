@@ -31,11 +31,11 @@ PROFILE_NAMES = {"a3_single": "六轴单臂", "a3_dual": "六轴双臂", "d3_dua
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, *, end_effector: str = "carm"):
         super().__init__(parent)
         self.setWindowTitle("CARM 手柄遥操")
         self.resize(1000, 800)
-        self.vm = ViewModel(self)
+        self.vm = ViewModel(end_effector=end_effector, parent=self)
         self._build_ui()
         self.vm.state_changed.connect(self.render_state)
         self.vm.snapshot_changed.connect(self.render_snapshot)

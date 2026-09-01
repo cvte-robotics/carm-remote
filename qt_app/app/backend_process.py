@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import deque
 import logging
+import re
 import sys
 from pathlib import Path
 import uuid
@@ -14,10 +15,19 @@ class BackendProcess(QObject):
     exited = pyqtSignal(int, object)
     diagnostic = pyqtSignal(str)
 
-    def __init__(self, root: Path, log_directory: Path, parent=None):
+    def __init__(
+        self,
+        root: Path,
+        log_directory: Path,
+        parent=None,
+        end_effector: str = "carm",
+    ):
         super().__init__(parent)
+        if not re.fullmatch(r"[a-zA-Z][a-zA-Z0-9_]*", str(end_effector or "")):
+            raise ValueError(f"invalid end-effector implementation name: {end_effector}")
         self.root = root
         self.log_directory = log_directory
+        self.end_effector = end_effector
         self.backend_log_file = log_directory / "desktop-backend.log"
         self._instance_token = uuid.uuid4().hex
         self._diagnostics: deque[str] = deque(maxlen=40)
@@ -38,11 +48,20 @@ class BackendProcess(QObject):
 
     def start(self) -> None:
         logging.getLogger("desktop.backend_process").info(
-            "Starting backend: %s -m server.desktop.app (cwd=%s)",
+            "Starting backend: %s -m server.desktop.app --end-effector %s (cwd=%s)",
             sys.executable,
+            self.end_effector,
             self.root,
         )
-        self.process.start(sys.executable, ["-m", "server.desktop.app"])
+        self.process.start(
+            sys.executable,
+            [
+                "-m",
+                "server.desktop.app",
+                "--end-effector",
+                self.end_effector,
+            ],
+        )
 
     def process_id(self) -> int:
         return int(self.process.processId())

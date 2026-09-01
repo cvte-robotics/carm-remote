@@ -10,6 +10,7 @@ import time
 from typing import Callable, Dict, Tuple, TypeVar
 
 from basic.joystick import Carm, JoystickController
+from basic.joystick.end_effectors import EndEffectorFactory
 from basic.joystick.session.arm import build_arm_bindings, desktop_arm_endpoint
 
 from .watchdog import HeartbeatWatchdog
@@ -73,8 +74,14 @@ class Lifecycle(str, Enum):
 
 
 class DesktopRuntime:
-    def __init__(self) -> None:
-        self.controller = JoystickController(arm_binding_builder=build_desktop_arm_bindings)
+    def __init__(
+        self,
+        end_effector_factory: EndEffectorFactory | None = None,
+    ) -> None:
+        self.controller = JoystickController(
+            arm_binding_builder=build_desktop_arm_bindings,
+            end_effector_factory=end_effector_factory,
+        )
         self._server = None
         self._state_lock = threading.RLock()
         self._operation_lock = threading.RLock()
@@ -82,10 +89,9 @@ class DesktopRuntime:
         self._cleanup_complete = False
         self._cleanup_attempt = 0
         self._cleanup_thread = None
-        self._retry_thread = None
         self._cleanup_reason = ""
-        self._cleanup_stop_mode = "hold"
-        self._latest_operation_generation = 0
+        self._latest_operation_generation = -1
+        self._cancelled_operation_generation = -1
         self.watchdog = HeartbeatWatchdog(self._handle_heartbeat_timeout)
 
     def attach_server(self, server) -> None:
@@ -106,54 +112,89 @@ class DesktopRuntime:
                 "cleanup_complete": self._cleanup_complete,
                 "retryable": not self._cleanup_complete and self._lifecycle is not Lifecycle.STOPPED,
                 "attempt": self._cleanup_attempt,
+                "latest_generation": self._latest_operation_generation,
             }
 
-    def run_operation(self, body: Dict[str, object], operation: Callable[[], OperationResult]) -> Tuple[bool, OperationResult | None]:
+    @staticmethod
+    def _operation_generation(body: Dict[str, object]) -> int | None:
         value = body.get("_desktop_generation")
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-            return False, None
+            return None
+        return value
+
+    def _admit_operation(self, generation: int, *, cancel: bool) -> bool:
         with self._state_lock:
             if self._lifecycle is not Lifecycle.RUNNING:
-                return False, None
-            if value < self._latest_operation_generation:
-                return False, None
-            self._latest_operation_generation = value
+                return False
+            if generation < self._latest_operation_generation:
+                return False
+            if generation > self._latest_operation_generation:
+                self._latest_operation_generation = generation
+            if cancel:
+                self._cancelled_operation_generation = max(
+                    self._cancelled_operation_generation,
+                    generation,
+                )
+                return True
+            return generation > self._cancelled_operation_generation
+
+    def _operation_is_current(self, generation: int, *, cancel: bool = False) -> bool:
+        with self._state_lock:
+            return bool(
+                self._lifecycle is Lifecycle.RUNNING
+                and generation == self._latest_operation_generation
+                and (
+                    cancel
+                    or generation > self._cancelled_operation_generation
+                )
+            )
+
+    def require_current_operation(self, body: Dict[str, object]) -> int:
+        generation = self._operation_generation(body)
+        if generation is None or not self._operation_is_current(generation):
+            raise RuntimeError("桌面请求已失效")
+        return generation
+
+    def run_operation(
+        self,
+        body: Dict[str, object],
+        operation: Callable[[], OperationResult],
+        *,
+        cancel: bool = False,
+    ) -> Tuple[bool, OperationResult | None]:
+        generation = self._operation_generation(body)
+        if generation is None or not self._admit_operation(generation, cancel=cancel):
+            return False, None
         with self._operation_lock:
-            with self._state_lock:
-                if (
-                    self._lifecycle is not Lifecycle.RUNNING
-                    or value < self._latest_operation_generation
-                ):
-                    return False, None
+            if not self._operation_is_current(generation, cancel=cancel):
+                return False, None
             return True, operation()
 
     def scan(self, controller, body: Dict[str, object]) -> Dict[str, object]:
         with self._operation_lock:
-            with self._state_lock:
-                if self._lifecycle is not Lifecycle.RUNNING:
-                    raise RuntimeError("桌面后端正在关闭")
+            self.require_current_operation(body)
             arm_probe = probe_current_arm(normalize_ipv4(body.get("current_arm_ip")))
+            self.require_current_operation(body)
             devices = controller.scan_devices()
         return {"data": devices, "arm_probe": {key: arm_probe[key] for key in ("ip", "arm_name", "arm_dof", "family")}, "allowed_profiles": arm_probe["allowed_profiles"]}
 
-    def request_shutdown(self, reason: str, *, stop_mode: str = "hold") -> dict[str, object]:
-        self._request_cleanup(reason, stop_mode)
+    def request_shutdown(self, reason: str) -> dict[str, object]:
+        self._request_cleanup(reason)
         return self.lifecycle_status()
 
-    def shutdown(self, reason: str, *, stop_mode: str = "hold") -> bool:
-        self._request_cleanup(reason, stop_mode)
+    def shutdown(self, reason: str) -> bool:
+        self._request_cleanup(reason)
         with self._state_lock:
             worker = self._cleanup_thread
         if worker is not None and worker is not threading.current_thread():
             worker.join()
         return self.lifecycle_status()["cleanup_complete"] is True
 
-    def _request_cleanup(self, reason: str, stop_mode: str) -> None:
+    def _request_cleanup(self, reason: str) -> None:
         with self._state_lock:
             if self._lifecycle is Lifecycle.RUNNING:
                 self._lifecycle = Lifecycle.SHUTDOWN_REQUESTED
                 self._cleanup_reason = reason
-                self._cleanup_stop_mode = "hold"
                 self.watchdog.stop()
             elif self._lifecycle in {Lifecycle.CLEANED, Lifecycle.SERVER_STOPPING, Lifecycle.STOPPED}:
                 return
@@ -170,8 +211,8 @@ class DesktopRuntime:
                 self._lifecycle = Lifecycle.CLEANING
                 self._cleanup_attempt += 1
                 attempt = self._cleanup_attempt
-                reason, stop_mode = self._cleanup_reason, self._cleanup_stop_mode
-            success = self._cleanup_attempt_once(reason, stop_mode)
+                reason = self._cleanup_reason
+            success = self._cleanup_attempt_once(reason)
             with self._state_lock:
                 self._cleanup_complete = success
                 if success:
@@ -185,30 +226,17 @@ class DesktopRuntime:
             logging.error("[DesktopRuntime] Cleanup incomplete; retrying in %.1fs", delay)
             time.sleep(delay)
 
-    def _cleanup_attempt_once(self, reason: str, stop_mode: str) -> bool:
+    def _cleanup_attempt_once(self, reason: str) -> bool:
         with self._operation_lock:
-            logging.info("[DesktopRuntime] Cleanup attempt %s: stop_session(%s)", self._cleanup_attempt, stop_mode)
-            success = True
-            if getattr(self.controller, "available", False):
-                try:
-                    success = bool(self.controller.stop_session(stop_mode="hold", reason=reason)) and success
-                except Exception:
-                    success = False
-                    logging.exception("[DesktopRuntime] Session cleanup failed")
-            registry = getattr(self.controller, "source_registry", None)
-            if registry is not None:
-                try:
-                    success = bool(registry.shutdown(reason)) and success
-                except Exception:
-                    success = False
-                    logging.exception("[DesktopRuntime] Provider shutdown failed")
-            if hasattr(self.controller, "_cleanup_lock"):
-                try:
-                    success = bool(self.controller.shutdown_cleanup_thread()) and success
-                except Exception:
-                    success = False
-                    logging.exception("[DesktopRuntime] Cleanup thread shutdown failed")
-            return success
+            logging.info(
+                "[DesktopRuntime] Cleanup attempt %s: controller.shutdown()",
+                self._cleanup_attempt,
+            )
+            try:
+                return bool(self.controller.shutdown(reason))
+            except Exception:
+                logging.exception("[DesktopRuntime] Controller cleanup failed")
+                return False
 
     def _shutdown_server(self) -> None:
         with self._state_lock:
@@ -219,4 +247,4 @@ class DesktopRuntime:
             self._lifecycle = Lifecycle.STOPPED
 
     def _handle_heartbeat_timeout(self) -> None:
-        self.request_shutdown("desktop-heartbeat-timeout", stop_mode="hold")
+        self.request_shutdown("desktop-heartbeat-timeout")

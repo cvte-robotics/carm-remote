@@ -1,8 +1,27 @@
-param(
-    [switch]$PreflightOnly
-)
-
 $ErrorActionPreference = 'Stop'
+$PreflightOnly = $false
+$EndEffector = 'carm'
+$ApplicationArgs = @()
+
+for ($Index = 0; $Index -lt $args.Count; $Index++) {
+    $Argument = [string]$args[$Index]
+    switch ($Argument) {
+        { $_ -in @('--end-effector', '-EndEffector') } {
+            if ($Index + 1 -ge $args.Count) {
+                throw "$Argument requires a value"
+            }
+            $Index++
+            $EndEffector = [string]$args[$Index]
+        }
+        { $_ -in @('--preflight-only', '-PreflightOnly') } {
+            $PreflightOnly = $true
+        }
+        default {
+            $ApplicationArgs += $Argument
+        }
+    }
+}
+
 $QtRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $BackendRoot = Split-Path -Parent $QtRoot
 $VenvRoot = Join-Path $QtRoot '.venv-windows'
@@ -63,6 +82,6 @@ if ($PreflightOnly) {
 }
 
 Set-Location $BackendRoot
-& $VenvPython (Join-Path $QtRoot 'main.py') @args
+& $VenvPython (Join-Path $QtRoot 'main.py') --end-effector $EndEffector @ApplicationArgs
 $ApplicationExitCode = $LASTEXITCODE
 exit $ApplicationExitCode

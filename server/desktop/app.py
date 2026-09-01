@@ -98,10 +98,10 @@ def _configure_backend_logging() -> Path:
 
 BACKEND_LOG_PATH = _configure_backend_logging()
 
-from api.joystick_routes import (
-    _failed,
-    _json_response,
-    register_desktop_joystick_routes,
+from api.joystick_routes import _json_response, register_joystick_routes
+from basic.joystick.end_effectors import (
+    EndEffectorBase,
+    resolve_end_effector_factory,
 )
 from desktop.runtime import DesktopRuntime
 
@@ -121,11 +121,13 @@ def create_app(runtime: DesktopRuntime | None = None):
         response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
         return response
 
-    register_desktop_joystick_routes(
+    register_joystick_routes(
         app,
         runtime.controller,
         scan_handler=runtime.scan,
         operation_runner=runtime.run_operation,
+        include_maintenance_routes=False,
+        allow_get_disconnect=False,
     )
 
     @app.get("/api/desktop/health")
@@ -151,18 +153,27 @@ def create_app(runtime: DesktopRuntime | None = None):
 
     @app.post("/api/desktop/shutdown")
     def desktop_shutdown():
-        status = runtime.request_shutdown("desktop-requested-shutdown", stop_mode="hold")
+        status = runtime.request_shutdown("desktop-requested-shutdown")
         return _json_response("正在清理", body={"data": status})
 
     return app, runtime
 
 
 def main(argv=None) -> int:
+    EndEffectorBase.load_all()
     parser = argparse.ArgumentParser(description="CARM Quest desktop backend")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    parser.add_argument(
+        "--end-effector",
+        default="carm",
+        help="包内末端实现名称（按名称动态导入）",
+    )
     args = parser.parse_args(argv)
 
-    app, runtime = create_app()
+    end_effector_factory = resolve_end_effector_factory(args.end_effector)
+    app, runtime = create_app(
+        DesktopRuntime(end_effector_factory=end_effector_factory)
+    )
     try:
         server = make_server(DEFAULT_HOST, args.port, app, threaded=True)
     except (OSError, SystemExit) as exc:
@@ -171,13 +182,19 @@ def main(argv=None) -> int:
 
     runtime.attach_server(server)
     runtime.start()
-    logging.info("Desktop backend listening on http://%s:%s", DEFAULT_HOST, args.port)
+    logging.info(
+        "Desktop backend listening on http://%s:%s end_effector=%s",
+        DEFAULT_HOST,
+        args.port,
+        args.end_effector,
+    )
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         logging.info("Desktop backend interrupted")
     finally:
-        cleanup_complete = runtime.shutdown("desktop-server-exit", stop_mode="hold")
+        cleanup_complete = runtime.shutdown("desktop-server-exit")
+
         if cleanup_complete:
             server.server_close()
         else:

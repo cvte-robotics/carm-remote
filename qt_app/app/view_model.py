@@ -20,7 +20,7 @@ class ViewModel(QObject):
     toast = pyqtSignal(str)
     closed = pyqtSignal()
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, *, end_effector: str = "carm"):
         super().__init__(parent)
         self.state = UiState()
         self.snapshot = Snapshot()
@@ -29,7 +29,12 @@ class ViewModel(QObject):
         self.backend_log_file = backend_log_path()
         self.http = HttpClient(parent=self)
         self.sse = SseClient(parent=self)
-        self.backend = BackendProcess(backend_root(), self.log_directory, self)
+        self.backend = BackendProcess(
+            backend_root(),
+            self.log_directory,
+            end_effector=end_effector,
+            parent=self,
+        )
         self.http.response.connect(self._response)
         self.sse.message_received.connect(self._event)
         self.sse.disconnected.connect(self._sse_disconnected)
@@ -43,6 +48,9 @@ class ViewModel(QObject):
         self.shutdown_timer = QTimer(self)
         self.shutdown_timer.setSingleShot(True)
         self.shutdown_timer.timeout.connect(self._shutdown_backend)
+        self.stop_retry_timer = QTimer(self)
+        self.stop_retry_timer.setSingleShot(True)
+        self.stop_retry_timer.timeout.connect(self._retry_manual_stop)
         self.shutdown_state = ShutdownState.NONE
         self.pending_connect = None
         self.health_request = None
@@ -53,7 +61,9 @@ class ViewModel(QObject):
         self.disconnect_request = None
         self.shutdown_request = None
         self.operation_generation = 0
+        self.workflow_generation = None
         self.quest_reconnecting = False
+        self.stop_retry_attempt = 0
 
     def start(self) -> None:
         logging.getLogger("desktop.ui").info(
@@ -117,7 +127,14 @@ class ViewModel(QObject):
                 return
             setattr(self, request_attribute, None)
         if error:
-            logging.getLogger("desktop.http").error(
+            retrying_manual_stop = bool(
+                path == "/api/joystick/disconnect"
+                and self.shutdown_state is ShutdownState.NONE
+                and self.state.name == "Stopping"
+                and self.backend.is_running()
+            )
+            logging.getLogger("desktop.http").log(
+                logging.WARNING if retrying_manual_stop else logging.ERROR,
                 "%s failed (request_id=%s): %s", path, request_id, error
             )
             if path == "/api/joystick/session_config":
@@ -125,12 +142,16 @@ class ViewModel(QObject):
             if path == "/api/joystick/scan":
                 self._set("Idle", error)
             elif path in {"/api/joystick/session_config", "/api/joystick/connect"}:
+                self.workflow_generation = None
                 self._set("ScanReady", error)
             elif path == "/api/joystick/init_arm":
                 self._set("Connected", error)
             elif path == "/api/joystick/disconnect":
                 if self.shutdown_state is not ShutdownState.NONE:
                     self._shutdown_backend()
+                elif retrying_manual_stop:
+                    self._schedule_manual_stop_retry()
+                    return
                 else:
                     self._set("Connected", error)
             elif path == "/api/desktop/shutdown" and self.shutdown_state is not ShutdownState.NONE:
@@ -143,12 +164,15 @@ class ViewModel(QObject):
             if self.pending_connect is not None:
                 device = self.pending_connect
                 self.pending_connect = None
+                generation = self.workflow_generation
+                if generation is None:
+                    return
                 self.connect_request = self.http.post(
                     "/api/joystick/connect",
                     {
                         "address": device.address,
                         "name": device.name,
-                        "_desktop_generation": self.operation_generation,
+                        "_desktop_generation": generation,
                     },
                 )
             return
@@ -165,6 +189,8 @@ class ViewModel(QObject):
         elif path == "/api/joystick/init_arm":
             self._set("Teleoperating", message)
         elif path == "/api/joystick/disconnect":
+            self.stop_retry_timer.stop()
+            self.stop_retry_attempt = 0
             self.sse.stop()
             if self.shutdown_state is not ShutdownState.NONE:
                 self._shutdown_backend()
@@ -224,6 +250,7 @@ class ViewModel(QObject):
 
     def connect(self, device: Device, profile: str, current_ip: str, other_ip: str, side: str, view_side: str) -> None:
         self.operation_generation += 1
+        self.workflow_generation = self.operation_generation
         self.profile = profile
         self.current_ip, self.other_ip = current_ip, other_ip
         self.side, self.view_side = side, view_side
@@ -236,7 +263,7 @@ class ViewModel(QObject):
                 "master_side": side,
                 "view_side": view_side,
                 "slave_ip": slave,
-                "_desktop_generation": self.operation_generation,
+                "_desktop_generation": self.workflow_generation,
             },
         )
         self._set("Connecting", f"正在连接 {device.name}...")
@@ -247,6 +274,10 @@ class ViewModel(QObject):
         return "dual", self.current_ip
 
     def initialize(self) -> None:
+        generation = self.workflow_generation
+        if generation is None:
+            self.toast.emit("当前连接工作流已失效")
+            return
         mode, slave = self._init_payload()
         self._set("Initializing", "正在初始化机械臂...")
         self.init_request = self.http.post(
@@ -256,24 +287,60 @@ class ViewModel(QObject):
                 "master_ip": self.current_ip,
                 "slave_ip": slave,
                 "master_side": self.side,
-                "_desktop_generation": self.operation_generation,
+                "_desktop_generation": generation,
             },
         )
 
     def set_scale(self, value: int) -> None:
-        self.http.post("/api/joystick/scale", {"value": value / 100})
+        if self.workflow_generation is None:
+            return
+        self.http.post(
+            "/api/joystick/scale",
+            {
+                "value": value / 100,
+                "_desktop_generation": self.workflow_generation,
+            },
+        )
 
     def set_view_side(self, value: str) -> None:
+        if self.workflow_generation is None:
+            return
         self.view_side = value
-        self.http.post("/api/joystick/view_side", {"value": value})
+        self.http.post(
+            "/api/joystick/view_side",
+            {
+                "value": value,
+                "_desktop_generation": self.workflow_generation,
+            },
+        )
 
     def calibration(self, value: int) -> None:
-        self.http.post("/api/joystick/calibration", {"value": value})
+        if self.workflow_generation is None:
+            return
+        self.http.post(
+            "/api/joystick/calibration",
+            {
+                "value": value,
+                "_desktop_generation": self.workflow_generation,
+            },
+        )
 
     def stop(self) -> None:
         self.operation_generation += 1
         self._invalidate_active_workflow()
+        self.sse.stop()
+        self.stop_retry_timer.stop()
+        self.stop_retry_attempt = 0
         self._set("Stopping", "正在停止手柄遥操...")
+        self._retry_manual_stop()
+
+    def _retry_manual_stop(self) -> None:
+        if (
+            self.shutdown_state is not ShutdownState.NONE
+            or self.state.name != "Stopping"
+            or not self.backend.is_running()
+        ):
+            return
         self.disconnect_request = self.http.post(
             "/api/joystick/disconnect",
             {
@@ -282,6 +349,18 @@ class ViewModel(QObject):
                 "_desktop_generation": self.operation_generation,
             },
         )
+
+    def _schedule_manual_stop_retry(self) -> None:
+        self.stop_retry_attempt += 1
+        retry_delays_ms = (1000, 2000, 5000)
+        delay_ms = retry_delays_ms[
+            min(self.stop_retry_attempt - 1, len(retry_delays_ms) - 1)
+        ]
+        self._set(
+            "Stopping",
+            "资源清理未完成，%s 秒后重试..." % (delay_ms // 1000),
+        )
+        self.stop_retry_timer.start(delay_ms)
 
     def shutdown(self) -> None:
         if self.shutdown_state is not ShutdownState.NONE:
@@ -292,6 +371,8 @@ class ViewModel(QObject):
             return
         self.operation_generation += 1
         self._invalidate_active_workflow()
+        self.stop_retry_timer.stop()
+        self.stop_retry_attempt = 0
         self._set("ShuttingDown", "正在关闭...")
         self.sse.stop()
         self.heartbeat_timer.stop()
@@ -315,6 +396,7 @@ class ViewModel(QObject):
         self.shutdown_request = self.http.post("/api/desktop/shutdown")
 
     def _invalidate_active_workflow(self) -> None:
+        self.workflow_generation = None
         self.pending_connect = None
         self.scan_request = None
         self.session_request = None
@@ -344,6 +426,7 @@ class ViewModel(QObject):
             self.toast.emit(f"{message}；日志：{self.backend_log_file}")
 
     def _backend_exited(self, exit_code: int, exit_status) -> None:
+        self.stop_retry_timer.stop()
         if self.shutdown_state is not ShutdownState.NONE:
             if exit_code == 0:
                 self._set("ShuttingDown", "后端已退出，等待窗口关闭")
