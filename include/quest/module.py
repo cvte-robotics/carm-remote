@@ -525,7 +525,7 @@ class QuestInputModule:
     def launch(serial: str) -> bool:
         return launch_quest_app(serial)
 
-    def start_reconnect_grace(
+    def begin_reconnect_grace(
         self,
         lease: SourceLease,
         evaluate_recovery: Callable[[], Tuple[bool, bool]],
@@ -545,35 +545,24 @@ class QuestInputModule:
     def owned_controllers(self):
         return self.policy.owned_controllers()
 
+    @property
+    def control_policy(self):
+        return self.policy
+
     def controller_for_hand(self, hand: str):
         return self.policy.controller_for_hand(hand)
 
     def controller_matches(self, hand: str, controller: object) -> bool:
         return self.policy.controller_matches(hand, controller)
 
-    def bind_controller(self, *args, **kwargs):
-        return self.policy.bind_controller(*args, **kwargs)
+    def bind_controller(self, hand, controller, controller_generation, input_generation, control_generation):
+        return self.policy.bind_controller(hand, controller, controller_generation, input_generation, control_generation)
 
-    def release_controller(self, *args, **kwargs):
-        return self.policy.release_controller(*args, **kwargs)
+    def release_controller(self, hand, controller, control_generation):
+        return self.policy.release_controller(hand, controller, control_generation)
 
-    def prepare_control(self, *args, **kwargs):
-        return self.policy.prepare_control(*args, **kwargs)
-
-    def commit_rebase(self, *args, **kwargs):
-        return self.policy.commit_rebase(*args, **kwargs)
-
-    def validate_dispatch(self, *args, **kwargs):
-        return self.policy.validate_dispatch(*args, **kwargs)
-
-    def commit_dispatch(self, *args, **kwargs):
-        return self.policy.commit_dispatch(*args, **kwargs)
-
-    def reject_dispatch(self, *args, **kwargs):
-        return self.policy.reject_dispatch(*args, **kwargs)
-
-    def request_mapping_change(self, *args, **kwargs):
-        return self.policy.request_mapping_change(*args, **kwargs)
+    def on_mapping_change(self, reason, active_hands, input_generation, control_generation):
+        return self.policy.request_mapping_change(reason, active_hands, input_generation, control_generation)
 
     def mark_input_disconnected(self):
         return self.policy.mark_disconnected()
@@ -597,10 +586,6 @@ class QuestInputModule:
         self.frame_window_start = now
         self.frame_count = 0
         return report
-
-    def reconnect_grace_expired(self, now: float) -> bool:
-        deadline = self.reconnect_deadline()
-        return deadline is not None and now >= deadline
 
     def reconnect_deadline(self) -> Optional[float]:
         with self.reconnect_timer_lock:

@@ -26,19 +26,16 @@ DEFAULT_JOYSTICK_CONFIG: Dict[str, Any] = {
         "rotation_threshold_deg": DEFAULT_QUEST_ROTATION_THRESHOLD_DEG,
     },
     "single_arm": {
-        "gripper_tau": 25,
         "init_joint": [-0.000192, 1.56713, -0.956551, 0.018883, 0.907339, -0.004005],
     },
     "dual_arm": {
         "left": {
-            "gripper_tau": 25,
             "init_joint": {
                 "six_axis": [-0.000192, 1.56713, -0.956551, 0.018883, 0.907339, -0.004005],
                 "seven_axis": [0, 0, 0, -1.57, 0, 0, 0],
             },
         },
         "right": {
-            "gripper_tau": 25,
             "init_joint": {
                 "six_axis": [-0.000192, 1.56713, -0.956551, 0.018883, 0.907339, -0.004005],
                 "seven_axis": [0, 0, 0, -1.57, 0, 0, 0],
@@ -54,7 +51,6 @@ class JoystickConfigError(ValueError):
 
 @dataclass(frozen=True)
 class ArmControlConfig:
-    gripper_tau: float
     init_joint: Tuple[float, ...]
 
 
@@ -110,7 +106,6 @@ class JoystickConfigSnapshot:
     def _parse_single_arm(self) -> ArmControlConfig:
         section = self._require_mapping(self._data, "single_arm")
         return ArmControlConfig(
-            gripper_tau=self._require_tau(section, "single_arm.gripper_tau"),
             init_joint=self._require_joint_list(section, "init_joint", 6, "single_arm.init_joint"),
         )
 
@@ -120,7 +115,6 @@ class JoystickConfigSnapshot:
         init_joint = self._require_mapping(section, "init_joint", f"dual_arm.{side}.init_joint")
         expected_count = 7 if axis_key == "seven_axis" else 6
         return ArmControlConfig(
-            gripper_tau=self._require_tau(section, f"dual_arm.{side}.gripper_tau"),
             init_joint=self._require_joint_list(
                 init_joint,
                 axis_key,
@@ -153,13 +147,6 @@ class JoystickConfigSnapshot:
             or value > maximum
         ):
             raise JoystickConfigError(f"{path} 必须是 (0, {maximum}] 范围内的有限数值")
-        return float(value)
-
-    @staticmethod
-    def _require_tau(container: Mapping[str, Any], path: str) -> float:
-        value = container.get("gripper_tau")
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
-            raise JoystickConfigError(f"{path} 必须是大于等于 0 的有限数值")
         return float(value)
 
     @staticmethod

@@ -36,11 +36,14 @@ try:
         def __init__(self, *args, **kwargs):
             self._connection_generation_lock = threading.RLock()
             self._lifecycle_lock = threading.RLock()
+            self._disconnect_reader = None
             super().__init__(*args, **kwargs)
 
         def connect(self, *args, **kwargs):
-            """Serialize a public reconnect with explicit disconnect cleanup."""
+            """Refuse reconnect until the previous SDK reader has exited."""
             with self._lifecycle_lock:
+                if not self.disconnect():
+                    return False
                 return super().connect(*args, **kwargs)
 
         def _create_connection(self):
@@ -50,12 +53,44 @@ try:
                 return super()._create_connection()
 
         def disconnect(self):
+            """Return True only after the exact SDK reader and socket are gone."""
             with self._lifecycle_lock:
+                reader = self._disconnect_reader or getattr(self, "reader", None)
                 with self._connection_generation_lock:
-                    # Publish stop state before releasing the lock; SDK disconnect joins reader.
                     self._running = False
                     self._reconnect_event.set()
-                return super().disconnect()
+                super().disconnect()
+                reader_stopped = bool(
+                    reader is None or not reader.is_alive()
+                )
+                self._disconnect_reader = None if reader_stopped else reader
+                return bool(
+                    reader_stopped
+                    and not getattr(self, "_running", False)
+                    and getattr(self, "reader", None) is None
+                    and getattr(self, "ws", None) is None
+                    and not self.open_ready.is_set()
+                )
+
+        def dispatch_joint_for_connection(
+            self,
+            joints,
+            expected_ws,
+            expected_state,
+            on_admit,
+            velocity,
+            wait,
+        ):
+            with self._connection_generation_lock:
+                if (
+                    not self._running
+                    or self.ws is not expected_ws
+                    or self.state is not expected_state
+                    or not self.is_connected()
+                    or not on_admit()
+                ):
+                    return False
+                return super().move_joint(joints, velocity, wait)
 
         def dispatch_pose_for_connection(
             self,

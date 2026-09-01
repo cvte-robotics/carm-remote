@@ -3,12 +3,12 @@
 from dataclasses import dataclass, replace
 from enum import Enum
 import itertools
+import logging
 import re
 from typing import Callable, Dict, Optional, Tuple
 
 from carm_teleop_input_contracts import (
     DeviceCandidate,
-    DeviceDescriptor,
     InputSourceModule,
     SourceCapabilities,
     SourceLease,
@@ -23,6 +23,25 @@ _BLE_ADDRESS_RE = re.compile(r"^(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
 
 class SourceScanError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class DeviceDescriptor:
+    candidate: DeviceCandidate
+    scan_generation: int
+    descriptor_id: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.candidate, DeviceCandidate):
+            raise ValueError("descriptor candidate is required")
+        for name, value in (
+            ("scan_generation", self.scan_generation),
+            ("descriptor_id", self.descriptor_id),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(
+                    f"descriptor {name} must be a non-negative integer"
+                )
 
 
 class BindingPhase(Enum):
@@ -241,8 +260,13 @@ class SourceRegistry:
     def begin_close(self, lease: SourceLease) -> bool:
         if self._active_lease != lease:
             return False
+        if self._closing_lease not in (None, lease):
+            return False
         self._closing_lease = lease
         return True
+
+    def cleanup_lease(self) -> Optional[SourceLease]:
+        return self._closing_lease or self._active_lease
 
     def complete_close(self, lease: SourceLease) -> bool:
         if self._active_lease != lease or self._closing_lease != lease:
@@ -251,16 +275,33 @@ class SourceRegistry:
         self._closing_lease = None
         return True
 
-    def finish(self, lease: SourceLease) -> bool:
-        """Compatibility alias for a fully completed close."""
-        if self._active_lease != lease:
-            return False
-        self._closing_lease = lease
-        return self.complete_close(lease)
-
     def active_module(self) -> Optional[InputSourceModule]:
         lease = self._active_lease
         return None if lease is None else self._modules.get(lease.provider_id)
+
+    def cleanup_idle_resources(self) -> bool:
+        """Clean fixed Provider owners that are not the exact closing lease."""
+        success = True
+        cleanup_lease = self.cleanup_lease()
+        for provider_id in _PROVIDER_ORDER:
+            if (
+                cleanup_lease is not None
+                and cleanup_lease.provider_id == provider_id
+            ):
+                continue
+            module = self._modules.get(provider_id)
+            if module is None or module.current_lease() is not None:
+                continue
+            try:
+                cleaned = bool(module.cleanup_idle_resources())
+            except Exception:
+                logging.exception(
+                    "[SourceRegistry] Idle Provider cleanup failed: %s",
+                    provider_id,
+                )
+                cleaned = False
+            success = cleaned and success
+        return success
 
     def retire_module(self, provider_id: str, reason: str) -> bool:
         if (
@@ -282,8 +323,17 @@ class SourceRegistry:
         success = True
         for provider_id in _PROVIDER_ORDER:
             module = self._modules.get(provider_id)
-            if module is not None:
-                success = self.retire_module(provider_id, reason) and success
+            if module is None:
+                continue
+            try:
+                retired = self.retire_module(provider_id, reason)
+            except Exception:
+                logging.exception(
+                    "[SourceRegistry] Provider shutdown failed: %s",
+                    provider_id,
+                )
+                retired = False
+            success = retired and success
         if success:
             self._active_lease = None
             self._closing_lease = None

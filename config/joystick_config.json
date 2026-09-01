@@ -4,7 +4,6 @@
     "rotation_threshold_deg": 20.0
   },
   "single_arm": {
-    "gripper_tau": 25,
     "init_joint": [
       -0.000192,
       1.56713,
@@ -16,7 +15,6 @@
   },
   "dual_arm": {
     "left": {
-      "gripper_tau": 25,
       "init_joint": {
         "six_axis": [
           -0.000192,
@@ -30,7 +28,6 @@
       }
     },
     "right": {
-      "gripper_tau": 25,
       "init_joint": {
         "six_axis": [
           -0.000192,

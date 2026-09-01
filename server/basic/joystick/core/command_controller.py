@@ -4,7 +4,8 @@ import numbers
 import threading
 import time
 from concurrent.futures import CancelledError as FuturesCancelledError, TimeoutError as FuturesTimeoutError
-from typing import Any, Dict, Optional, List
+from dataclasses import dataclass
+from typing import Any, Dict, Optional, List, Tuple
 
 from ..runtime.dependencies import (
     ARM_SDK_AVAILABLE, Carm, CarmSdk, DEPENDENCIES_AVAILABLE, np, R,
@@ -19,25 +20,82 @@ from .pose_math import (
     project_input_to_arm,
 )
 
+
+@dataclass(frozen=True)
+class ControlSample:
+    pose_data: Any
+    button_data: Any
+    calibration: Any
+    scale: float
+    input_sequence: int
+    input_generation: int
+    control_generation: int
+    input_source: str
+    source_lease: Any
+    source_token: Any
+    source_controller_generation: int
+    pose_epoch: int
+    arm_connection_generation: int
+    arm_feedback_state_sequence: Optional[int]
+    arm_feedback_fresh: bool
+
+
+@dataclass(frozen=True)
+class ControlComputation:
+    joint_move: Any = None
+
+
+@dataclass(frozen=True)
+class DispatchAttempt:
+    target_revision: int
+    target_pose: Tuple[float, ...]
+    input_sequence: int
+    input_generation: int
+    control_generation: int
+    pose_epoch: int
+    input_source: str
+    arm_connection_generation: int
+    arm_feedback_state_sequence: Optional[int]
+    source_token: Any
+    source_controller_generation: int
+    pending_input_pose: Any
+    pending_target_pose: Any
+    end_effector_trigger: int
+    end_effector_driver: Any
+    carm: Any
+    arm_ws_identity: Any
+    arm_state_identity: Any
+    hand_binding: str
+    arm_role: str
+
+
+@dataclass(frozen=True)
+class JointMoveAttempt:
+    joints: Tuple[float, ...]
+    pose_epoch: int
+    input_generation: int
+    control_generation: int
+    input_source: str
+    arm_connection_generation: int
+    carm: Any
+    arm_ws_identity: Any
+    arm_state_identity: Any
+
+
 class CommandController:
     """控制算法核心类"""
     def __init__(
         self,
         scale=0.4,
-        gripper_max_value=0.08,
-        joystick_controller: 'JoystickController'=None,
         hand_binding=HAND_RIGHT,
         arm_role="master",
-        gripper_tau=DEFAULT_GRIPPER_TAU,
         configured_init_joint=None,
     ):
         self.isStop = False
         self.end_arm_pose = [0, 0, 0, 0, 0, 0, 1]
-        self.gripper_max_value = gripper_max_value
         self.scale = scale
         self.hand_binding = normalize_hand(hand_binding, HAND_RIGHT)
         self.arm_role = arm_role
-        self.gripper_tau = float(gripper_tau)
         self.default_init_joint = [-0.000192, 1.56713, -0.956551, 0.018883, 0.907339, -0.004005]
         self.seven_axis_init_joint = [0, 0, 0, -1.57, 0, 0, 0]
         self.init_joint_ = (
@@ -45,9 +103,6 @@ class CommandController:
             if configured_init_joint is not None
             else self.default_init_joint.copy()
         )
-
-        # 保存 JoystickController 引用用于运行时状态同步。
-        self.joystick_controller = joystick_controller
 
         self.zero_joint = [0,0,0,0,0,0]
         self.seven_axis_zero_joint = [0,0,0,0,0,0,0]
@@ -63,6 +118,8 @@ class CommandController:
         self.target_arm_connection_generation = None
         self.target_arm_feedback_state_sequence = None
         self.target_source_token = None
+        self.target_end_effector_trigger = None
+        self.target_revision = 0
         self.relative_quaternion = None
         self.pending_pose_segment = None
         self.pose_state_lock = threading.RLock()
@@ -73,17 +130,14 @@ class CommandController:
         self._arm_ws_identity = None
         self._arm_state_identity = None
         self._arm_connected = False
-        self.end_gripper_pose = None
-        self.end_gripper_tau = None
         self.zero_quat = [0, 0, 0, 1]
 
         self.last_aButton = False
         self.last_bButton = False
         self.need_sync_feedback = False
         self.carm_ = None
-        self.pose_update_callback = None  # 回调函数，用于更新gripper_pose和gripper_tau 到 state
-        self.end_effector_type = "gripper"
-        self._missing_hand_api_logged = False
+        self._pending_joint_move = None
+        self.end_effector_driver = None
         self.carm_device_index = None
         self.use_seven_axis_joints = False
         self.source_controller_generation = 0
@@ -154,9 +208,6 @@ class CommandController:
                     return False
 
                 self.init_joint_ = list(temp_joint)
-                if self.joystick_controller:
-                    self.joystick_controller.set_cached_init_position(self.arm_role, self.init_joint_)
-
                 logging.warning(f"[CommandController] Init position confirmed and cached: {self.init_joint_}")
                 return True
 
@@ -174,28 +225,17 @@ class CommandController:
         logging.warning(f"[CommandController] Getting init position: {self.init_joint_}")
         if self.init_joint_ is None:
             return {"init_joint": None}
-        cached_position = (
-            self.joystick_controller.get_cached_init_position(self.arm_role)
-            if self.joystick_controller
-            else None
-        )
-        if cached_position and len(cached_position) == self._expected_joint_count():
-            return {"init_joint": cached_position}
         return {"init_joint": self.init_joint_}
 
-    def load_cached_init_position(self, _ip: str) -> bool:
+    def load_cached_init_position(self, cached_position) -> bool:
         """存在接口缓存时覆盖配置初始化值，否则保留配置或原生默认值。"""
         try:
-            if self.joystick_controller:
-                cached_position = self.joystick_controller.get_cached_init_position(self.arm_role)
-                expected_joint_count = self._expected_joint_count()
-                if cached_position and len(cached_position) == expected_joint_count:
-                    self.init_joint_ = cached_position
-                    logging.info(f"[CommandController] Loaded cached init position: {cached_position}")
-                    return True
-                logging.info("[CommandController] No valid cached position found; keeping configured init position")
-            else:
-                logging.warning("[CommandController] No joystick_controller reference available for cache loading")
+            expected_joint_count = self._expected_joint_count()
+            if _is_valid_joint_position(cached_position, expected_joint_count):
+                self.init_joint_ = list(cached_position)
+                logging.info(f"[CommandController] Loaded cached init position: {cached_position}")
+                return True
+            logging.info("[CommandController] No valid cached position found; keeping configured init position")
         except Exception as e:
             logging.error(f"[CommandController] Error loading cached init position: {e}")
         return False
@@ -377,8 +417,6 @@ class CommandController:
                 logging.error(f"[Arm] Error checking connection status: {e}")
                 return False
 
-            self._refresh_end_effector_type()
-
             logging.info("[Arm] Connected. Enabling servo...")
             self.carm_.set_ready()
             time.sleep(0.2)
@@ -406,11 +444,10 @@ class CommandController:
         logging.info("[Arm] Moving to configured initialization position...")
         try:
             init_joint = self._active_init_joint()
-            if self.joystick_controller and not self.joystick_controller.claim_input_command():
-                logging.warning("[CommandController] Input disconnected before initialization movement command")
-                return False
             logging.info(f"[CommandController] Sending move_joint command to position: {init_joint}")
-            self.carm_.move_joint(init_joint, 5, True)
+            if self.carm_.move_joint(init_joint, 5, True) is not True:
+                logging.error("[CommandController] Initialization move_joint was rejected")
+                return False
             self._refresh_current_pose()
             logging.info("[Arm] Initialization movement completed successfully")
             return True
@@ -419,17 +456,9 @@ class CommandController:
             logging.exception(e)
             return False
 
-    def initArm(self, control_host) -> bool:
-        """兼容单臂初始化：准备完成后执行初始化运动。"""
-        return self.prepareArm(control_host) and self.moveToInitPosition()
-
-    def update_pose(self, pos):
-        """更新机械臂位置"""
-        if pos and len(pos) >= 7:
-            self.end_arm_pose = list(pos[:7])
-
     def reject_pose_target(self) -> None:
         with self.pose_state_lock:
+            self.target_revision += 1
             self.target_end_arm_pose = None
             self.target_input_sequence = None
             self.target_input_generation = None
@@ -439,9 +468,8 @@ class CommandController:
             self.target_arm_connection_generation = None
             self.target_arm_feedback_state_sequence = None
             self.target_source_token = None
+            self.target_end_effector_trigger = None
             self.pending_pose_segment = None
-            self.end_gripper_pose = None
-            self.end_gripper_tau = None
 
     def invalidate_pose_mapping(self) -> None:
         with self.pose_state_lock:
@@ -450,10 +478,6 @@ class CommandController:
             self.relative_quaternion = None
             self.need_sync_feedback = True
 
-    def snapshot_control_lifecycle(self):
-        with self.pose_state_lock:
-            return self.pose_epoch, self.arm_connection_generation
-
     def _reset_pose_state(self, end_vr_pose):
         """Reset the committed input/arm baselines and uncommitted segment state."""
         with self.pose_state_lock:
@@ -461,21 +485,89 @@ class CommandController:
             self.init_end_arm_pose = self.end_arm_pose[:7]
             self.reject_pose_target()
             self.relative_quaternion = None
-            if self.pose_update_callback:
-                try:
-                    self.pose_update_callback(None, None)
-                except Exception as e:
-                    logging.warning(f"[CommandController] Error resetting gripper state: {e}")
 
-    def commit_pending_pose_segment(self) -> None:
-        with self.pose_state_lock:
-            pending = self.pending_pose_segment
-            if pending is None:
-                return
-            self.init_end_vr_pose = pending["input_pose"].copy()
-            self.init_end_arm_pose = pending["target_pose"].copy()
+    def _commit_dispatch_attempt_locked(self, attempt: DispatchAttempt) -> None:
+        if attempt.pending_input_pose is not None:
+            self.init_end_vr_pose = attempt.pending_input_pose.copy()
+            self.init_end_arm_pose = attempt.pending_target_pose.copy()
             self.relative_quaternion = None
-            self.pending_pose_segment = None
+        self.pending_pose_segment = None
+
+    def _dispatch_attempt_matches_locked(self, attempt: DispatchAttempt) -> bool:
+        return bool(
+            self.target_revision == attempt.target_revision
+            and not self.isStop
+            and self.target_input_sequence == attempt.input_sequence
+            and self.target_input_generation == attempt.input_generation
+            and self.target_control_generation == attempt.control_generation
+            and self.target_pose_epoch == attempt.pose_epoch
+            and self.target_input_source == attempt.input_source
+            and self.target_arm_connection_generation
+            == attempt.arm_connection_generation
+            and self.target_arm_feedback_state_sequence
+            == attempt.arm_feedback_state_sequence
+            and self.target_source_token == attempt.source_token
+            and self.end_effector_driver is attempt.end_effector_driver
+            and self.pose_epoch == attempt.pose_epoch
+            and self.arm_connection_generation
+            == attempt.arm_connection_generation
+            and self.arm_feedback_state_sequence
+            == attempt.arm_feedback_state_sequence
+            and self.carm_ is attempt.carm
+            and self._arm_connected
+            and self.arm_feedback_connection_generation
+            == attempt.arm_connection_generation
+            and attempt.carm.ws is attempt.arm_ws_identity
+            and attempt.carm.state is attempt.arm_state_identity
+        )
+
+    def _capture_dispatch_attempt_locked(self) -> Optional[DispatchAttempt]:
+        if (
+            self.isStop
+            or self.target_end_arm_pose is None
+            or self.target_end_effector_trigger is None
+            or self.end_effector_driver is None
+            or self.target_pose_epoch != self.pose_epoch
+            or self.target_arm_connection_generation
+            != self.arm_connection_generation
+            or self.target_arm_feedback_state_sequence
+            != self.arm_feedback_state_sequence
+            or not self.carm_
+            or not self.carm_.is_connected()
+            or not self._arm_connected
+            or self.arm_feedback_connection_generation
+            != self.arm_connection_generation
+            or self.carm_.ws is not self._arm_ws_identity
+            or self.carm_.state is not self._arm_state_identity
+        ):
+            return None
+        pending = self.pending_pose_segment
+        return DispatchAttempt(
+            target_revision=self.target_revision,
+            target_pose=tuple(self.target_end_arm_pose[:7]),
+            input_sequence=self.target_input_sequence,
+            input_generation=self.target_input_generation,
+            control_generation=self.target_control_generation,
+            pose_epoch=self.target_pose_epoch,
+            input_source=self.target_input_source,
+            arm_connection_generation=self.target_arm_connection_generation,
+            arm_feedback_state_sequence=self.target_arm_feedback_state_sequence,
+            source_token=self.target_source_token,
+            source_controller_generation=self.source_controller_generation,
+            pending_input_pose=(
+                pending["input_pose"].copy() if pending is not None else None
+            ),
+            pending_target_pose=(
+                pending["target_pose"].copy() if pending is not None else None
+            ),
+            end_effector_trigger=self.target_end_effector_trigger,
+            end_effector_driver=self.end_effector_driver,
+            carm=self.carm_,
+            arm_ws_identity=self._arm_ws_identity,
+            arm_state_identity=self._arm_state_identity,
+            hand_binding=self.hand_binding,
+            arm_role=self.arm_role,
+        )
 
     def _transform_input_pose(self, pose_data, calibration):
         pose = [pose_data.x, pose_data.y, pose_data.z]
@@ -546,25 +638,15 @@ class CommandController:
         self.last_bButton = bool(button_status.btn_yb)
         return True
 
-    def _commit_successful_dispatch(self) -> None:
-        if self._set_end_effector() is not True:
-            raise RuntimeError("end-effector command was rejected")
-        self.commit_pending_pose_segment()
-        if self.joystick_controller:
-            self.joystick_controller._commit_source_dispatch_locked(
-                self,
-                self.target_source_token,
-            )
-
-    def process_input_sample(self, data):
+    def process_input_sample(self, sample: ControlSample) -> ControlComputation:
         """Apply one normalized host input sample to the control mapping."""
         if not DEPENDENCIES_AVAILABLE:
             self.reject_pose_target()
-            return
+            return ControlComputation()
 
         try:
-            pose_data = data['poseData']
-            button_status = data['buttonStatus']
+            pose_data = sample.pose_data
+            button_status = sample.button_data
 
             value_trigger = button_status.trigger
             value_squeeze = button_status.grip
@@ -572,33 +654,30 @@ class CommandController:
             flag_aButton = button_status.btn_xa
             flag_bButton = button_status.btn_yb
 
-            end_vr_pose = self._transform_input_pose(pose_data, data['calibration'])
+            end_vr_pose = self._transform_input_pose(pose_data, sample.calibration)
 
-            self.compute_control(
+            return self.compute_control(
                 end_vr_pose,
                 flag_squeeze,
                 flag_aButton,
                 flag_bButton,
                 value_trigger,
-                data['inputSequence'],
-                data['inputGeneration'],
-                data['controlGeneration'],
-                data['scale'],
-                data['inputSource'],
-                data['poseEpoch'],
-                data['armConnectionGeneration'],
-                data['armFeedbackFresh'],
-                data.get('armFeedbackStateSequence'),
-                data.get('sourceToken'),
+                sample.input_sequence,
+                sample.input_generation,
+                sample.control_generation,
+                sample.scale,
+                sample.input_source,
+                sample.pose_epoch,
+                sample.arm_connection_generation,
+                sample.arm_feedback_fresh,
+                sample.arm_feedback_state_sequence,
+                sample.source_token,
             )
         except Exception as e:
             self.invalidate_pose_mapping()
             logging.exception(e)
             logging.error(f"[CommandController] Callback error: {e}")
-
-    def surreal_callback(self, data):
-        """Compatibility proxy for the former source-named control entry."""
-        return self.process_input_sample(data)
+            return ControlComputation()
 
     def compute_control(
         self,
@@ -619,14 +698,16 @@ class CommandController:
         source_token=None,
     ):
         """Serialize mutable pose mapping state for one control sample."""
+        joint_move = None
         with self.pose_state_lock:
+            self._pending_joint_move = None
             if (
                 self.isStop
                 or expected_pose_epoch != self.pose_epoch
                 or arm_connection_generation != self.arm_connection_generation
             ):
                 self.reject_pose_target()
-                return
+                return ControlComputation()
             self._compute_control_locked(
                 end_vr_pose,
                 flag_squeeze,
@@ -644,6 +725,25 @@ class CommandController:
                 arm_feedback_state_sequence,
                 source_token,
             )
+            joint_move = self._pending_joint_move
+            self._pending_joint_move = None
+
+        return ControlComputation(joint_move=joint_move)
+
+    def dispatch_joint_move_attempt(self, attempt: JointMoveAttempt, admit) -> bool:
+        """Execute one already-admitted joint movement without Host locks."""
+        sender = getattr(attempt.carm, "dispatch_joint_for_connection", None)
+        if not callable(sender):
+            raise RuntimeError("Carm SDK adapter lacks generation-bound joint dispatch")
+
+        return sender(
+            list(attempt.joints),
+            attempt.arm_ws_identity,
+            attempt.arm_state_identity,
+            admit,
+            5,
+            False,
+        )
 
     def _compute_control_locked(
         self,
@@ -668,7 +768,17 @@ class CommandController:
             if not flag_squeeze and not self.last_aButton:
                 logging.info("[Control] Reset to home")
                 if self.carm_:
-                    self.carm_.move_joint(self._active_init_joint(), 5, False)
+                    self._pending_joint_move = JointMoveAttempt(
+                        joints=tuple(self._active_init_joint()),
+                        pose_epoch=self.pose_epoch,
+                        input_generation=input_generation,
+                        control_generation=control_generation,
+                        input_source=input_source,
+                        arm_connection_generation=self.arm_connection_generation,
+                        carm=self.carm_,
+                        arm_ws_identity=self._arm_ws_identity,
+                        arm_state_identity=self._arm_state_identity,
+                    )
                 self.last_aButton = True
                 self.need_sync_feedback = True
             else:
@@ -746,6 +856,7 @@ class CommandController:
             delta_pos,
             delta_quat,
         )
+        self.target_revision += 1
         self.target_end_arm_pose = target_pose
         self.target_input_sequence = input_sequence
         self.target_input_generation = input_generation
@@ -755,6 +866,9 @@ class CommandController:
         self.target_arm_connection_generation = arm_connection_generation
         self.target_arm_feedback_state_sequence = arm_feedback_state_sequence
         self.target_source_token = source_token
+        if self.end_effector_driver is None:
+            raise RuntimeError("end-effector driver is not bound")
+        self.target_end_effector_trigger = value_trigger
         self.pending_pose_segment = None
         if (
             not self.last_bButton
@@ -765,167 +879,39 @@ class CommandController:
                 "target_pose": target_pose.copy(),
             }
 
-        self.end_gripper_pose = max(
-            0.0,
-            min(
-                (1.0 - value_trigger / 127.0) * self.gripper_max_value,
-                self.gripper_max_value,
-            ),
-        )
-        self.end_gripper_tau = (
-            DEFAULT_GRIPPER_TAU
-            if self.end_effector_type == "hand"
-            else self.gripper_tau
-        )
-
-        if self.pose_update_callback:
-            try:
-                self.pose_update_callback(self.end_gripper_pose, self.end_gripper_tau)
-            except Exception as e:
-                logging.warning(
-                    f"[CommandController] Error updating gripper_pose and gripper_tau in state: {e}"
-                )
-
-    def _refresh_end_effector_type(self) -> str:
-        """初始化时读取并缓存末端类型，旧 SDK 或异常时保持原夹爪控制行为。"""
-        try:
-            raw_type = getattr(self.carm_, "end_effector_type", "")
-            eeff_type = str(getattr(raw_type, "value", raw_type) or "").strip().lower()
-        except Exception as e:
-            logging.warning(f"[CommandController] Failed to read end effector type, fallback to gripper: {e}")
-            self.end_effector_type = "gripper"
-            return self.end_effector_type
-
-        if eeff_type in ("flange", "hand", "gripper"):
-            self.end_effector_type = eeff_type
-            logging.info(f"[CommandController] Cached end effector type: {self.end_effector_type}")
-            return self.end_effector_type
-
-        if eeff_type:
-            logging.warning(f"[CommandController] Unsupported end effector type '{eeff_type}', fallback to gripper")
-        self.end_effector_type = "gripper"
-        return self.end_effector_type
-
-    def _dispatch_pose_current_connection(self, target_pose):
-        """Send pose, commit its segment, and send the end effector on one SDK connection."""
-        sender = getattr(self.carm_, "dispatch_pose_for_connection", None)
+    def dispatch_pose_attempt(self, attempt: DispatchAttempt):
+        """Run one already-admitted physical transaction without Host locks."""
+        sender = getattr(attempt.carm, "dispatch_pose_for_connection", None)
         if not callable(sender):
             logging.error(
                 "[CommandController] Carm SDK adapter lacks generation-bound dispatch"
             )
             return False
-        return sender(
-            target_pose,
-            self._arm_ws_identity,
-            self._commit_successful_dispatch,
-        )
 
-    def _set_end_effector(self) -> bool:
-        """按末端类型分发控制命令，并报告命令是否被接受。"""
-        if self.end_gripper_pose is None:
-            return True
-
-        eeff_type = self.end_effector_type
-        if eeff_type == "flange":
-            return True
-
-        if eeff_type == "hand":
-            set_hand = getattr(self.carm_, "set_hand", None)
-            if not callable(set_hand):
-                if not self._missing_hand_api_logged:
-                    logging.error("[CommandController] End effector is hand but Carm SDK has no callable set_hand")
-                    self._missing_hand_api_logged = True
-                return False
-            result = set_hand(
-                self.end_gripper_pose,
-                self.end_gripper_tau,
-                HAND_CONTROL_VELOCITY,
-            )
-            return result is True or result == 1
-
-        result = self.carm_.set_gripper(
-            self.end_gripper_pose,
-            self.end_gripper_tau,
-        )
-        return result is True or result == 1
-
-    def loop(self):
-        """控制循环（CONTROL_LOOP_HZ）"""
-        logging.info("[Control] Loop started")
-        while not self.isStop:
+        def send_end_effector() -> None:
+            """Best-effort末端发送，不让末端反馈失败升级为位姿事务失败。"""
             try:
-                arm_feedback_fresh = self._refresh_current_pose()
-                hand_state = None
-                if self.joystick_controller:
-                    hand_state = self.joystick_controller.get_control_hand_state(
-                        self,
-                        self.hand_binding,
-                        arm_feedback_fresh,
-                    )
+                accepted = attempt.end_effector_driver.set_eff(
+                    attempt.end_effector_trigger,
+                )
+            except Exception:
+                logging.exception(
+                    "[CommandController] End-effector send raised for %s",
+                    attempt.arm_role,
+                )
+                return
+            if accepted is not True:
+                logging.warning(
+                    "[CommandController] End-effector send was not accepted for %s: %r",
+                    attempt.arm_role,
+                    accepted,
+                )
 
-                if hand_state and hand_state.get("pose_data") and hand_state.get("button_data"):
-                    # 读取最新数据
-                    pose_data = hand_state["pose_data"]
-                    button_data = hand_state["button_data"]
-                    calibration = hand_state["calibration"]
-
-                    self.process_input_sample({
-                        "poseData": pose_data,
-                        "buttonStatus": button_data,
-                        "calibration": calibration,
-                        "inputSequence": hand_state["input_sequence"],
-                        "inputGeneration": hand_state["input_generation"],
-                        "controlGeneration": hand_state["control_generation"],
-                        "scale": hand_state["scale"],
-                        "inputSource": hand_state["input_source"],
-                        "poseEpoch": hand_state["pose_epoch"],
-                        "armConnectionGeneration": hand_state["arm_connection_generation"],
-                        "armFeedbackFresh": arm_feedback_fresh,
-                        "armFeedbackStateSequence": hand_state["arm_feedback_state_sequence"],
-                        "sourceToken": hand_state.get("source_token"),
-                    })
-                else:
-                    self.reject_pose_target()
-
-                if self.target_end_arm_pose is not None and self.carm_ and self.carm_.is_connected():
-                    if self.joystick_controller:
-                        self.joystick_controller.dispatch_pose_command(self)
-                    else:
-                        with self.pose_state_lock:
-                            dispatch_allowed = (
-                                not self.isStop
-                                and self.target_end_arm_pose is not None
-                                and self.target_arm_connection_generation == self.arm_connection_generation
-                                and self._arm_connected
-                                and self.arm_feedback_connection_generation
-                                == self.arm_connection_generation
-                                and self.carm_.is_connected()
-                                and self.carm_.ws is self._arm_ws_identity
-                            )
-                            if not dispatch_allowed:
-                                self.reject_pose_target()
-                            else:
-                                dispatched = self._dispatch_pose_current_connection(
-                                    self.target_end_arm_pose[:7]
-                                )
-                                if dispatched is not True:
-                                    logging.error(
-                                        "[CommandController] track_pose rejected for %s: %r",
-                                        self.arm_role,
-                                        dispatched,
-                                    )
-                                    self.invalidate_pose_mapping()
-
-                time.sleep(CONTROL_LOOP_INTERVAL)
-            except Exception as e:
-                logging.exception(e)
-                logging.error(f"[Control] Loop error: {e}")
-                self.halt_control()
-                if self.joystick_controller:
-                    self.joystick_controller._mark_disconnected_and_request_cleanup(
-                        f"control-loop-error:{self.arm_role}"
-                    )
-                break
+        return sender(
+            list(attempt.target_pose),
+            attempt.arm_ws_identity,
+            send_end_effector,
+        )
 
     def halt_control(self) -> None:
         """停止控制输出并清空目标，不发送任何机械臂运动命令。"""
@@ -941,7 +927,13 @@ class CommandController:
             if self.carm_ and self.carm_.is_connected():
                 logging.info("[CommandController] Moving to zero position...")
                 try:
-                    self.carm_.move_joint(self._active_zero_joint(), 5, True)
+                    if self.carm_.move_joint(
+                        self._active_zero_joint(), 5, True
+                    ) is not True:
+                        logging.error(
+                            "[CommandController] Home move_joint was rejected"
+                        )
+                        return False
                     self._refresh_current_pose()
                     logging.info("[CommandController] Stop command completed, arm reached zero position")
                 except Exception as e:
@@ -955,8 +947,3 @@ class CommandController:
             logging.exception(e)
             logging.error(f"[CommandController] Error moving to zero position: {e}")
             return False
-
-    def stop(self, move_home: bool = False) -> None:
-        self.halt_control()
-        if move_home:
-            self.move_home()

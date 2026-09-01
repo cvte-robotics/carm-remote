@@ -4,7 +4,17 @@ import math
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Tuple
 
-from carm_teleop_input_contracts import HAND_LEFT, HAND_RIGHT
+from carm_teleop_input_contracts import (
+    ControlAction,
+    ControlCompletion,
+    ControlContext,
+    ControlDecision,
+    ControlOutcome,
+    ControlResult,
+    HAND_LEFT,
+    HAND_RIGHT,
+    PolicyDispatchContext,
+)
 
 
 @dataclass(frozen=True)
@@ -484,6 +494,63 @@ class QuestInputPolicy:
             source_token=source_token,
         )
 
+    def decide_control(self, context: ControlContext) -> ControlDecision:
+        decision = self.prepare_control(
+            context.hand,
+            context.controller,
+            context.controller_generation,
+            context.input_generation,
+            context.control_generation,
+            context.bound_active,
+            context.need_sync_feedback,
+        )
+        if decision.pin is not None:
+            if not decision.pin_matches:
+                return ControlDecision(ControlAction.REJECT, None, "stale_rebase_pin")
+            return ControlDecision(
+                ControlAction.REBASE,
+                decision.pin,
+                "pose_mapping_invalidated",
+                decision.pin.raw_pose,
+            )
+        if not decision.ready:
+            return ControlDecision(ControlAction.REJECT, None, "input_not_ready")
+        return ControlDecision(ControlAction.READY, decision.source_token, "ready")
+
+    def complete_control(self, completion: ControlCompletion) -> ControlResult:
+        context = completion.context
+        result = completion.result
+        token = result.source_token
+        if result.outcome is ControlOutcome.REBASE_APPLIED:
+            committed = token is not None and self.commit_rebase(context.hand, token)
+            return ControlResult(
+                ControlOutcome.REBASE_APPLIED if committed else ControlOutcome.STALE,
+                token,
+                "committed" if committed else "stale",
+            )
+        if result.outcome is ControlOutcome.DISPATCH_COMMITTED:
+            committed = token is not None and self.commit_dispatch(
+                context.hand,
+                context.controller,
+                context.controller_generation,
+                token,
+                context.input_generation,
+                context.control_generation,
+            )
+            return ControlResult(
+                result.outcome if committed else ControlOutcome.STALE,
+                token,
+                "committed" if committed else "stale",
+            )
+        if result.outcome is ControlOutcome.DISPATCH_REJECTED:
+            self.reject_dispatch(
+                context.hand,
+                context.input_generation,
+                context.control_generation,
+                token,
+            )
+        return result
+
     def commit_rebase(self, hand: str, pin: _QuestRebasePin) -> bool:
         state = self.__hand_states[hand]
         if state.pin is not pin:
@@ -495,7 +562,7 @@ class QuestInputPolicy:
         state.last_handled_fi = pin.frame_index
         return True
 
-    def validate_dispatch(
+    def _validate_dispatch(
         self,
         hand: str,
         controller: object,
@@ -503,6 +570,7 @@ class QuestInputPolicy:
         source_token: Optional[QuestSourceToken],
         input_generation: int,
         control_generation: int,
+        require_current_frame: bool = True,
     ) -> bool:
         if source_token is None:
             return False
@@ -516,11 +584,27 @@ class QuestInputPolicy:
             and state.pin is None
             and state.required_epoch == state.handled_jump_epoch == source_token.jump_epoch
             and state.latest_frame_pose_valid
-            and state.latest_frame_new_valid
-            and state.latest_valid_fi == source_token.frame_index
-            and state.latest_receiver_generation == source_token.receiver_generation
+            and (
+                not require_current_frame
+                or (
+                    state.latest_frame_new_valid
+                    and state.latest_valid_fi == source_token.frame_index
+                    and state.latest_receiver_generation == source_token.receiver_generation
+                )
+            )
             and source_token.frame_index != state.rebase_sequence
             and source_token.frame_index != state.last_handled_fi
+        )
+
+    def validate_dispatch(self, context: PolicyDispatchContext) -> bool:
+        return self._validate_dispatch(
+            context.hand,
+            context.controller,
+            context.controller_generation,
+            context.source_token,
+            context.input_generation,
+            context.control_generation,
+            require_current_frame=context.require_current_frame,
         )
 
     def commit_dispatch(
@@ -532,13 +616,14 @@ class QuestInputPolicy:
         input_generation: int,
         control_generation: int,
     ) -> bool:
-        if not self.validate_dispatch(
+        if not self._validate_dispatch(
             hand,
             controller,
             controller_generation,
             source_token,
             input_generation,
             control_generation,
+            require_current_frame=False,
         ):
             return False
         state = self.__hand_states[hand]

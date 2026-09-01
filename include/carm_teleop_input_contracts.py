@@ -217,23 +217,6 @@ class DeviceCandidate:
 
 
 @dataclass(frozen=True)
-class DeviceDescriptor:
-    candidate: DeviceCandidate
-    scan_generation: int
-    descriptor_id: int
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.candidate, DeviceCandidate):
-            raise ValueError("descriptor candidate is required")
-        for name, value in (
-            ("scan_generation", self.scan_generation),
-            ("descriptor_id", self.descriptor_id),
-        ):
-            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-                raise ValueError(f"descriptor {name} must be a non-negative integer")
-
-
-@dataclass(frozen=True)
 class SourceLease:
     provider_id: str
     module_instance_id: int
@@ -254,6 +237,74 @@ class ConnectOutcome(Enum):
     READY = "ready"
     PENDING = "pending"
     FAILED = "failed"
+
+
+class ControlAction(Enum):
+    """Neutral decision for one input-driven control sample."""
+
+    READY = "ready"
+    REBASE = "rebase"
+    REJECT = "reject"
+
+
+class ControlOutcome(Enum):
+    """Fact reported after Host completes the control attempt."""
+
+    REBASE_APPLIED = "rebase_applied"
+    DISPATCH_COMMITTED = "dispatch_committed"
+    DISPATCH_REJECTED = "dispatch_rejected"
+    STALE = "stale"
+
+
+@dataclass(frozen=True)
+class ControlDecision:
+    action: ControlAction
+    source_token: Optional[object]
+    reason: str = ""
+    rebase_payload: Optional[object] = None
+
+
+@dataclass(frozen=True)
+class ControlResult:
+    outcome: ControlOutcome
+    source_token: Optional[object]
+    reason: str = ""
+
+
+@dataclass(frozen=True)
+class ControlContext:
+    hand: str
+    controller: object
+    controller_generation: int
+    input_generation: int
+    control_generation: int
+    bound_active: bool
+    need_sync_feedback: bool
+
+
+@dataclass(frozen=True)
+class PolicyDispatchContext:
+    hand: str
+    controller: object
+    controller_generation: int
+    source_token: object
+    input_generation: int
+    control_generation: int
+    require_current_frame: bool = True
+
+
+@dataclass(frozen=True)
+class ControlCompletion:
+    context: PolicyDispatchContext
+    result: ControlResult
+
+
+class SourceControlPolicy(Protocol):
+    """Policy seam used by a source adapter and the joystick Host."""
+
+    def decide_control(self, context: ControlContext) -> ControlDecision: ...
+    def validate_dispatch(self, context: PolicyDispatchContext) -> bool: ...
+    def complete_control(self, completion: ControlCompletion) -> ControlResult: ...
 
 
 @dataclass(frozen=True)

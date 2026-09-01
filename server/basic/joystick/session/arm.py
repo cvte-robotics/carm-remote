@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
 from carm_teleop_input_contracts import HAND_LEFT, HAND_RIGHT, normalize_hand, opposite_hand
+from ..end_effectors import EndEffectorFactory, validate_end_effector_driver
+from .control_transaction import ControlTransaction
 
 
 LOCAL_ARM_CONTROL_HOST = "127.0.0.1"
@@ -83,15 +85,33 @@ class ArmRuntime:
     device_index: Optional[int]
     hand: str
     controller: object
+    transaction: Optional[ControlTransaction] = None
+    end_effector: Optional[object] = None
     thread: Optional[threading.Thread] = None
+    carm_disconnected: bool = False
+    home_completed: bool = False
 
 
 class BaseArmSession:
-    def __init__(self, owner, bindings: List[Dict[str, Any]], controller_factory: Callable[[str, str], object]):
+    def __init__(
+        self,
+        owner,
+        bindings: List[Dict[str, Any]],
+        controller_factory: Callable[[str, str], object],
+        end_effector_factory: Optional[EndEffectorFactory] = None,
+    ):
         self.owner = owner
         self.bindings = bindings
         self.controller_factory = controller_factory
+        self.end_effector_factory = end_effector_factory
         self.arms: List[ArmRuntime] = []
+        self._home_requested = False
+
+    @property
+    def home_pending(self) -> bool:
+        return self._home_requested and any(
+            not runtime.home_completed for runtime in self.arms
+        )
 
     def initialize(self) -> bool:
         runtimes: List[ArmRuntime] = []
@@ -108,22 +128,39 @@ class BaseArmSession:
                     hand=binding["hand"],
                     controller=controller,
                 )
-                controller.load_cached_init_position(runtime.ip)
+                controller.load_cached_init_position(
+                    self.owner.get_cached_init_position(runtime.role)
+                )
                 runtimes.append(runtime)
 
-            if len(runtimes) == 1:
-                if not runtimes[0].controller.initArm(runtimes[0].control_host):
+            for runtime in runtimes:
+                if not runtime.controller.prepareArm(runtime.control_host):
                     self._cleanup_started(runtimes)
                     return False
-            else:
-                for runtime in runtimes:
-                    if not runtime.controller.prepareArm(runtime.control_host):
-                        self._cleanup_started(runtimes)
-                        return False
 
-                if not self._move_to_init_concurrently(runtimes):
+            for runtime in runtimes:
+                if self.end_effector_factory is None:
+                    raise RuntimeError("end-effector factory is required")
+                controller = runtime.controller
+                runtime.end_effector = validate_end_effector_driver(
+                    self.end_effector_factory(
+                        carm=controller.carm_,
+                        side=runtime.hand,
+                        role=runtime.role,
+                    )
+                )
+                controller.end_effector_driver = runtime.end_effector
+
+            if len(runtimes) == 1:
+                if (
+                    not self.owner.is_input_connected()
+                    or not runtimes[0].controller.moveToInitPosition()
+                ):
                     self._cleanup_started(runtimes)
                     return False
+            elif not self._move_to_init_concurrently(runtimes):
+                self._cleanup_started(runtimes)
+                return False
 
             if not self.owner.is_input_connected():
                 logging.warning("[ArmSession] Input disconnected before control loops started")
@@ -136,10 +173,16 @@ class BaseArmSession:
                     self._cleanup_started(runtimes)
                     return False
 
-            for runtime in runtimes:
+            self.arms = runtimes
+            for runtime in self.arms:
                 controller = runtime.controller
                 controller.isStop = False
-                runtime.thread = threading.Thread(target=controller.loop, daemon=True, name=f"JoystickArmLoop-{runtime.role}")
+                runtime.transaction = ControlTransaction(self.owner, runtime)
+                runtime.thread = threading.Thread(
+                    target=runtime.transaction.run,
+                    daemon=True,
+                    name=f"JoystickArmLoop-{runtime.role}",
+                )
                 runtime.thread.start()
                 self.owner.set_arm_runtime_state(
                     runtime.role,
@@ -149,7 +192,6 @@ class BaseArmSession:
                     control_host=runtime.control_host,
                     device_index=runtime.device_index,
                 )
-            self.arms = runtimes
             return True
         except Exception:
             self._cleanup_started(runtimes)
@@ -168,7 +210,10 @@ class BaseArmSession:
                 return
             start_times[runtime.role] = time.monotonic()
             try:
-                results[runtime.role] = runtime.controller.moveToInitPosition()
+                results[runtime.role] = bool(
+                    self.owner.is_input_connected()
+                    and runtime.controller.moveToInitPosition()
+                )
             except Exception:
                 logging.exception("[ArmSession] Initialization movement failed for role=%s", runtime.role)
                 results[runtime.role] = False
@@ -201,37 +246,87 @@ class BaseArmSession:
     def stop(self, move_home: bool = False) -> bool:
         success = True
         threads_stopped = True
+        self._home_requested = bool(move_home)
+
         for runtime in self.arms:
-            runtime.controller.halt_control()
+            try:
+                if runtime.transaction is not None:
+                    runtime.transaction.request_stop()
+            except Exception:
+                logging.exception(
+                    "[ArmSession] Failed to request control stop for role=%s",
+                    runtime.role,
+                )
+                success = False
 
         for runtime in self.arms:
             try:
                 if runtime.thread and runtime.thread.is_alive():
                     runtime.thread.join(timeout=2.0)
-                    if runtime.thread.is_alive():
-                        threads_stopped = False
-                        success = False
+                if runtime.thread and runtime.thread.is_alive():
+                    threads_stopped = False
+                    success = False
+                else:
+                    runtime.thread = None
             except Exception:
                 threads_stopped = False
                 success = False
 
-        if move_home and threads_stopped and self.arms:
-            if len(self.arms) > 1:
-                success &= self._move_home_concurrently(self.arms)
-            else:
-                try:
-                    self.arms[0].controller.move_home()
-                except Exception:
-                    logging.exception("[ArmSession] Single-arm home movement failed")
-                    success = False
-
         for runtime in self.arms:
             try:
-                if getattr(runtime.controller, "carm_", None):
-                    runtime.controller.carm_.disconnect()
+                runtime.controller.halt_control()
             except Exception:
+                logging.exception(
+                    "[ArmSession] Failed to invalidate control mapping for role=%s",
+                    runtime.role,
+                )
                 success = False
-            finally:
+
+        # Keep the arm set intact until every control loop has stopped, so a
+        # manual dual-arm home can never degrade into a one-arm operation.
+        if not threads_stopped:
+            return False
+
+        if self._home_requested and self.arms:
+            pending_home = [
+                runtime for runtime in self.arms if not runtime.home_completed
+            ]
+            if len(pending_home) > 1:
+                home_clean = self._move_home_concurrently(pending_home)
+            elif pending_home:
+                try:
+                    pending_home[0].home_completed = bool(
+                        pending_home[0].controller.move_home()
+                    )
+                except Exception:
+                    logging.exception("[ArmSession] Single-arm home movement failed")
+                home_clean = pending_home[0].home_completed
+            else:
+                home_clean = True
+            if not home_clean:
+                return False
+            self._home_requested = False
+
+        remaining: List[ArmRuntime] = []
+        for runtime in self.arms:
+            if not runtime.carm_disconnected:
+                try:
+                    carm = getattr(runtime.controller, "carm_", None)
+                    if carm is not None and carm.disconnect() is not True:
+                        remaining.append(runtime)
+                        success = False
+                        continue
+                    runtime.carm_disconnected = True
+                except Exception:
+                    logging.exception(
+                        "[ArmSession] Carm disconnect failed for role=%s",
+                        runtime.role,
+                    )
+                    remaining.append(runtime)
+                    success = False
+                    continue
+
+            try:
                 self.owner.set_arm_runtime_state(
                     runtime.role,
                     runtime.ip,
@@ -241,8 +336,16 @@ class BaseArmSession:
                     device_index=runtime.device_index,
                 )
                 self.owner.release_source_controller(runtime.controller)
-        self.arms = []
-        return success
+            except Exception:
+                logging.exception(
+                    "[ArmSession] Host owner release failed for role=%s",
+                    runtime.role,
+                )
+                remaining.append(runtime)
+                success = False
+
+        self.arms = remaining
+        return success and not self.arms
 
     def _move_home_concurrently(self, runtimes: List[ArmRuntime]) -> bool:
         start_gate = threading.Event()
@@ -286,38 +389,14 @@ class BaseArmSession:
             skew_ms = (max(start_times.values()) - min(start_times.values())) * 1000.0
             logging.info("[ArmSession] Dual-arm home command start skew: %.3f ms", skew_ms)
 
+        for runtime in runtimes:
+            if results.get(runtime.role) is True:
+                runtime.home_completed = True
         return len(results) == len(runtimes) and all(results.values())
 
     def get_primary_controller(self):
         return self.arms[0].controller if self.arms else None
 
-    def _cleanup_started(self, started: List[ArmRuntime]) -> None:
-        for runtime in started:
-            runtime.controller.halt_control()
-
-        for runtime in reversed(started):
-            try:
-                if runtime.thread and runtime.thread.is_alive():
-                    runtime.thread.join(timeout=2.0)
-                if getattr(runtime.controller, "carm_", None):
-                    runtime.controller.carm_.disconnect()
-            except Exception:
-                pass
-            finally:
-                self.owner.set_arm_runtime_state(
-                    runtime.role,
-                    runtime.ip,
-                    runtime.hand,
-                    False,
-                    control_host=runtime.control_host,
-                    device_index=runtime.device_index,
-                )
-                self.owner.release_source_controller(runtime.controller)
-
-
-class SingleArmSession(BaseArmSession):
-    pass
-
-
-class DualArmSession(BaseArmSession):
-    pass
+    def _cleanup_started(self, started: List[ArmRuntime]) -> bool:
+        self.arms = list(started)
+        return self.stop(move_home=False)
