@@ -37,6 +37,8 @@ carm_quest_desktop/
 │   ├── requirements.txt
 │   ├── run_linux.sh
 │   ├── run_windows.ps1
+│   ├── scripts/
+│   │   └── collect_data.py
 │   └── app/
 │       ├── __init__.py
 │       ├── backend_process.py
@@ -124,7 +126,13 @@ carm_quest_desktop/
 | `qt_app/requirements.txt` | 启动脚本使用的 Python 依赖列表 |
 | `qt_app/pyproject.toml` | 项目名称、Python 版本范围、依赖范围和 Ruff 行宽配置 |
 
-### 4.2 `qt_app/app/`
+### 4.2 `qt_app/scripts/`
+
+| 文件 | 主要对象 | 职责 |
+|---|---|---|
+| `collect_data.py` | `build_parser`、`create_arms`、`collect_plan_data`、`run` | 连接并校验 A3 单臂、A3 双臂或 D3 双臂，按固定间隔采集机械臂和末端计划位置/速度/力矩，并写入 CSV |
+
+### 4.3 `qt_app/app/`
 
 | 文件 | 主要对象 | 职责 |
 |---|---|---|

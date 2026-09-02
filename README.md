@@ -133,6 +133,26 @@ Linux：
 
 检查内容包括 Python 版本、Python 依赖、Carm 包版本、ADB、运行端口和仓库运行文件。
 
+### 采集机械臂计划数据
+
+`qt_app/scripts/collect_data.py` 用于在遥操过程中按固定间隔采集机械臂和末端的计划位置、速度和力矩，并写入 CSV。脚本会先连接并校验指定型号的机械臂；结束时按 `Ctrl+C`，或使用 `--duration` / `--count` 设置采集边界。
+
+在仓库根目录执行时，建议使用 Qt 应用创建的虚拟环境中的 Python：
+
+```powershell
+qt_app\.venv-windows\Scripts\python.exe qt_app\scripts\collect_data.py --single-a3 --ip 192.168.1.10 --duration 30
+```
+
+支持的连接方式如下：
+
+| 模式 | 必需参数 |
+|---|---|
+| A3 六轴单臂 | `--single-a3 --ip <控制器 IP>` |
+| A3 六轴双臂 | `--dual-a3 --left-ip <左臂 IP> --right-ip <右臂 IP>` |
+| D3 七轴双臂 | `--dual-d3 --ip <控制器 IP>`，可用 `--left-index` 和 `--right-index` 指定臂索引 |
+
+默认每 `100` ms 采集一帧，输出到当前执行目录下带时间戳的 `collect_data_*.csv`。可通过 `--interval-ms`、`--duration`、`--count` 和 `--output` 调整采样间隔、时长、帧数和输出路径。CSV 中的计划数据字段以 JSON 字符串保存；双臂模式会分别使用 `left` 和 `right` 作为 `arm` 字段值。
+
 ## 使用流程
 
 1. 输入当前机械臂的 IP 地址。
