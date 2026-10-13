@@ -1,6 +1,4 @@
-"""
-单双臂遥操 session 编排。
-"""
+"""单双臂遥操 session 编排：落地 ArmRuntime 并编排连接/回零/启停，任一步失败即回收。"""
 
 import logging
 import threading
@@ -10,6 +8,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from carm_teleop_input_contracts import HAND_LEFT, HAND_RIGHT, normalize_hand, opposite_hand
 from ..end_effectors import EndEffectorFactory, validate_end_effector_driver
+from .end_effector_sender import AsyncEndEffectorSender
 from .control_transaction import ControlTransaction
 
 
@@ -18,12 +17,14 @@ ArmEndpointResolver = Callable[[str, str, bool], str]
 
 
 def board_arm_endpoint(role: str, management_ip: str, same_board_dual: bool) -> str:
+    """控制板侧 endpoint 解析：master 或同板双臂走本机回环。"""
     if role == "master" or same_board_dual:
         return LOCAL_ARM_CONTROL_HOST
     return management_ip
 
 
 def desktop_arm_endpoint(role: str, management_ip: str, same_board_dual: bool) -> str:
+    """桌面侧 endpoint 解析：始终使用管理网 IP。"""
     del role, same_board_dual
     return management_ip
 
@@ -35,7 +36,14 @@ def build_arm_bindings(
     slave_ip: Optional[str] = None,
     endpoint_resolver: ArmEndpointResolver = board_arm_endpoint,
 ) -> List[Dict[str, Any]]:
-    """Resolve management addresses into explicit arm-control endpoints."""
+    """把管理网地址解析为显式的单臂控制 endpoint 绑定列表。
+
+    Args: mode "single"/"dual"；master_ip 主臂管理网 IP；master_side 主臂手侧
+        （同板双臂忽略此值，固定 index 0 为左、index 1 为右）；
+        slave_ip 双臂模式下的从臂 IP；endpoint_resolver endpoint 解析策略。
+    Returns: binding dict 列表，字段为 role/ip/control_host/device_index/hand。
+    Raises: ValueError mode 不受支持，或双臂模式缺少 slave_ip。
+    """
     normalized_mode = (mode or "single").strip().lower()
     normalized_master_side = normalize_hand(master_side, HAND_RIGHT)
 
@@ -46,7 +54,6 @@ def build_arm_bindings(
                 "ip": master_ip,
                 "control_host": endpoint_resolver("master", master_ip, False),
                 "device_index": None,
-                "use_seven_axis_joints": False,
                 "hand": normalized_master_side,
             }
         ]
@@ -56,29 +63,39 @@ def build_arm_bindings(
     if not slave_ip:
         raise ValueError("slave_ip is required for dual mode")
 
-    same_board_dual = master_ip == slave_ip
+    # 先按非同板规则解析 endpoint，再判断两个臂是否实际指向同一控制端点。
+    # 控制板侧主臂固定走本机回环，因此从臂填写 127.0.0.1 时，即使管理 IP
+    # 文本不同，两个 Carm 仍属于同一服务；桌面侧远端主臂和回环从臂仍保持区分。
+    master_endpoint = endpoint_resolver("master", master_ip, False)
+    slave_endpoint = endpoint_resolver("slave", slave_ip, False)
+    same_board_dual = (
+        master_ip == slave_ip or master_endpoint == slave_endpoint
+    )
+    # 同板双臂（人形双臂）的 Carm 索引与手侧是物理固定的：index 0 为左臂、
+    # index 1 为右臂，左手柄控制左臂、右手柄控制右臂，不随 master_side 变化。
+    master_hand = HAND_LEFT if same_board_dual else normalized_master_side
     return [
         {
             "role": "master",
             "ip": master_ip,
             "control_host": endpoint_resolver("master", master_ip, same_board_dual),
             "device_index": 0 if same_board_dual else None,
-            "use_seven_axis_joints": same_board_dual,
-            "hand": normalized_master_side,
+            "hand": master_hand,
         },
         {
             "role": "slave",
             "ip": slave_ip,
             "control_host": endpoint_resolver("slave", slave_ip, same_board_dual),
             "device_index": 1 if same_board_dual else None,
-            "use_seven_axis_joints": same_board_dual,
-            "hand": opposite_hand(normalized_master_side),
+            "hand": opposite_hand(master_hand),
         },
     ]
 
 
 @dataclass
 class ArmRuntime:
+    """单臂运行态：controller、控制事务、end-effector 与线程句柄（含幂等进度标记）。"""
+
     role: str
     ip: str
     control_host: str
@@ -87,12 +104,16 @@ class ArmRuntime:
     controller: object
     transaction: Optional[ControlTransaction] = None
     end_effector: Optional[object] = None
+    # 控制环看到的末端驱动：包装 end_effector，SDK 阻塞调用在独立线程执行。
+    end_effector_sender: Optional[AsyncEndEffectorSender] = None
     thread: Optional[threading.Thread] = None
     carm_disconnected: bool = False
     home_completed: bool = False
 
 
 class BaseArmSession:
+    """单/双臂 session 的公共编排基类（由具体 profile 派生）。"""
+
     def __init__(
         self,
         owner,
@@ -100,6 +121,7 @@ class BaseArmSession:
         controller_factory: Callable[[str, str], object],
         end_effector_factory: Optional[EndEffectorFactory] = None,
     ):
+        """绑定 owner、binding 列表与 controller/end-effector 工厂。"""
         self.owner = owner
         self.bindings = bindings
         self.controller_factory = controller_factory
@@ -109,17 +131,23 @@ class BaseArmSession:
 
     @property
     def home_pending(self) -> bool:
+        """是否仍有已请求但未完成的回零。"""
         return self._home_requested and any(
             not runtime.home_completed for runtime in self.arms
         )
 
     def initialize(self) -> bool:
+        """完成连接、准备、end-effector 装配与回零，随后启动控制线程。
+
+        Returns: 全部运行时就绪且控制线程已启动时为 True。
+        Raises: RuntimeError end-effector 工厂缺失。
+        """
         runtimes: List[ArmRuntime] = []
+        self.arms = runtimes
         try:
             for binding in self.bindings:
                 controller = self.controller_factory(binding["role"], binding["hand"])
                 controller.carm_device_index = binding["device_index"]
-                controller.use_seven_axis_joints = binding["use_seven_axis_joints"]
                 runtime = ArmRuntime(
                     role=binding["role"],
                     ip=binding["ip"],
@@ -128,12 +156,19 @@ class BaseArmSession:
                     hand=binding["hand"],
                     controller=controller,
                 )
-                controller.load_cached_init_position(
-                    self.owner.get_cached_init_position(runtime.role)
-                )
                 runtimes.append(runtime)
 
             for runtime in runtimes:
+                if (not self.owner.is_input_connected()
+                        or not runtime.controller.connectArm(runtime.control_host)):
+                    self._cleanup_started(runtimes)
+                    return False
+                self.owner.configure_arm_initialization(runtime)
+
+            for runtime in runtimes:
+                if not self.owner.is_input_connected():
+                    self._cleanup_started(runtimes)
+                    return False
                 if not runtime.controller.prepareArm(runtime.control_host):
                     self._cleanup_started(runtimes)
                     return False
@@ -149,7 +184,10 @@ class BaseArmSession:
                         role=runtime.role,
                     )
                 )
-                controller.end_effector_driver = runtime.end_effector
+                runtime.end_effector_sender = AsyncEndEffectorSender(
+                    runtime.end_effector, runtime.role,
+                )
+                controller.end_effector_driver = runtime.end_effector_sender
 
             if len(runtimes) == 1:
                 if (
@@ -178,6 +216,8 @@ class BaseArmSession:
                 controller = runtime.controller
                 controller.isStop = False
                 runtime.transaction = ControlTransaction(self.owner, runtime)
+                if runtime.end_effector_sender is not None:
+                    runtime.end_effector_sender.start()
                 runtime.thread = threading.Thread(
                     target=runtime.transaction.run,
                     daemon=True,
@@ -198,12 +238,14 @@ class BaseArmSession:
             raise
 
     def _move_to_init_concurrently(self, runtimes: List[ArmRuntime]) -> bool:
+        """并发下发双臂初始化运动，并对齐命令下发时刻。"""
         start_gate = threading.Event()
         cancel_event = threading.Event()
         results: Dict[str, bool] = {}
         start_times: Dict[str, float] = {}
 
         def move(runtime: ArmRuntime) -> None:
+            """等待启动栅栏后下发单臂初始化运动。"""
             start_gate.wait()
             if cancel_event.is_set():
                 results[runtime.role] = False
@@ -244,6 +286,11 @@ class BaseArmSession:
         return len(results) == len(runtimes) and all(results.values())
 
     def stop(self, move_home: bool = False) -> bool:
+        """停止控制线程、按需回零，并释放 Carm 连接与 owner 归属。
+
+        Args: move_home 是否在停止前把 pending 的机械臂送回零点。
+        Returns: 全部运行时已干净释放（``self.arms`` 为空）时为 True。
+        """
         success = True
         threads_stopped = True
         self._home_requested = bool(move_home)
@@ -282,8 +329,23 @@ class BaseArmSession:
                 )
                 success = False
 
-        # Keep the arm set intact until every control loop has stopped, so a
-        # manual dual-arm home can never degrade into a one-arm operation.
+        # 控制线程停止后丢弃待发末端值并等待在途 SDK 调用结束，再回零/断开 Carm。
+        for runtime in self.arms:
+            sender = runtime.end_effector_sender
+            try:
+                if sender is not None and not sender.stop():
+                    threads_stopped = False
+                    success = False
+            except Exception:
+                logging.exception(
+                    "[ArmSession] Failed to stop end-effector sender for role=%s",
+                    runtime.role,
+                )
+                threads_stopped = False
+                success = False
+
+        # 在每个控制循环停止前保持臂集合完整，避免手动双臂回零
+        # 退化为单臂操作。
         if not threads_stopped:
             return False
 
@@ -348,12 +410,14 @@ class BaseArmSession:
         return success and not self.arms
 
     def _move_home_concurrently(self, runtimes: List[ArmRuntime]) -> bool:
+        """并发下发回零命令，并标记成功的运行时。"""
         start_gate = threading.Event()
         cancel_event = threading.Event()
         results: Dict[str, bool] = {}
         start_times: Dict[str, float] = {}
 
         def move_home(runtime: ArmRuntime) -> None:
+            """等待启动栅栏后下发单臂回零运动。"""
             start_gate.wait()
             if cancel_event.is_set():
                 results[runtime.role] = False
@@ -395,8 +459,10 @@ class BaseArmSession:
         return len(results) == len(runtimes) and all(results.values())
 
     def get_primary_controller(self):
+        """返回首臂 controller（无臂时为 None）。"""
         return self.arms[0].controller if self.arms else None
 
     def _cleanup_started(self, started: List[ArmRuntime]) -> bool:
+        """把已启动运行时登记为 arms 后执行不回零的停止。"""
         self.arms = list(started)
         return self.stop(move_home=False)

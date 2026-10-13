@@ -318,7 +318,7 @@ class ViewModel(QObject):
         if self.workflow_generation is None:
             return
         self.http.post(
-            "/api/joystick/calibration",
+            "/api/joystick/yaw",
             {
                 "value": value,
                 "_desktop_generation": self.workflow_generation,

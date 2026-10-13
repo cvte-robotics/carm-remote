@@ -1,4 +1,4 @@
-"""Six-finger EtherCAT/CAN-FD passthrough over one existing Carm."""
+"""基于单个既存 Carm 连接实现的六指 EtherCAT/CAN-FD 透传。"""
 
 import logging
 import math
@@ -22,6 +22,7 @@ MOTION_DURATION_MS = 1000
 
 
 def modbus_crc16(data: bytes) -> int:
+    """计算 Modbus CRC-16（多项式 0xA001）校验值。"""
     crc = 0xFFFF
     for value in data:
         crc ^= value
@@ -31,6 +32,12 @@ def modbus_crc16(data: bytes) -> int:
 
 
 def build_hand_frame(side: str, finger_id: int, position: int) -> dict:
+    """构造单指透传帧（含 CRC 与帧尾填充）。
+
+    Args: side "left"/"right"；finger_id 0..5；position 0..1000。
+    Returns: 与 Carm 透传接口一致的 dict（can_id/flags/can_fd/data）。
+    Raises: ValueError 臂侧、手指编号或位置越界。
+    """
     if side not in SLAVE_IDS:
         raise ValueError(f"unsupported hand side: {side}")
     if not 0 <= finger_id < FINGER_COUNT:
@@ -64,9 +71,15 @@ def build_hand_frame(side: str, finger_id: int, position: int) -> dict:
 
 
 class PassthroughEndEffector(EndEffectorBase):
+    """通过 Carm 透传接口驱动六指手的 end-effector 实现。"""
+
     NAME = "passthrough"
 
     def __init__(self, context: EndEffectorContext, **options) -> None:
+        """校验臂侧并取用 Carm SDK 的透传发送接口。
+
+        Raises: ValueError 臂侧不支持；RuntimeError SDK 不支持透传。
+        """
         super().__init__(context, **options)
         normalized_side = (context.side or "").strip().lower()
         if normalized_side not in SLAVE_IDS:
@@ -78,6 +91,12 @@ class PassthroughEndEffector(EndEffectorBase):
         self._side = normalized_side
 
     def set_eff(self, trigger: int) -> bool:
+        """把 trigger 映射为六指位置，逐指下发透传帧。
+
+        Args: trigger 为 provider 归一化后的触发值（按 0-127 归一化到 0-1000）。
+        Returns: 恒为 True（单指异常只记录日志，不中断其余手指）。
+        Raises: ValueError trigger 非数值或非有限值。
+        """
         if isinstance(trigger, bool) or not isinstance(trigger, (int, float)):
             raise ValueError("passthrough end-effector trigger must be numeric")
         value = float(trigger)

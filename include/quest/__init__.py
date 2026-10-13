@@ -1,4 +1,4 @@
-"""Quest device adaptation module."""
+"""Quest 设备适配模块（输入源 provider 入口）。"""
 
 MODULE_ID = "quest"
 MODULE_API_VERSION = 1

@@ -1,8 +1,9 @@
-"""Reusable HTTP/SSE routes for Board Web and desktop joystick profiles."""
+"""控制板 Web 与桌面 joystick profile 复用的 HTTP/SSE 路由。"""
 
 from __future__ import annotations
 
 from functools import wraps
+from contextlib import nullcontext
 import json
 import logging
 import time
@@ -18,6 +19,7 @@ OperationRunner = Callable[..., Tuple[bool, object]]
 
 
 def _json_response(msg: str = "successed", code: int = 1, body=None, status: int = 200):
+    """构造带 CORS 头的统一 JSON 响应。"""
     payload = dict(body or {})
     payload["msg"] = msg
     payload["code"] = code
@@ -33,10 +35,12 @@ def _json_response(msg: str = "successed", code: int = 1, body=None, status: int
 
 
 def _failed(msg: str):
+    """构造 code=0 的失败响应。"""
     return _json_response(msg=msg, code=0)
 
 
 def _default_scan(controller, body: Dict[str, object]) -> Dict[str, object]:
+    """默认扫描处理器：直接调用 controller.scan_devices()。"""
     del body
     return {"data": controller.scan_devices()}
 
@@ -51,12 +55,23 @@ def register_joystick_routes(
     *,
     dependencies_available=True,
 ) -> None:
-    """Register one profile-aware joystick HTTP/SSE implementation."""
+    """注册一套 profile 感知的 joystick HTTP/SSE 路由。
+
+    Args:
+        app: Flask 应用。
+        controller: 控制器实例或其 getter。
+        scan_handler: 可覆盖的扫描处理器。
+        operation_runner: 桌面端用户操作准入包装。
+        include_maintenance_routes: 是否注册维护类路由。
+        allow_get_disconnect: 是否允许用 GET 停止会话。
+        dependencies_available: 依赖可用性（布尔或可调用）。
+    """
 
     custom_scan_handler = scan_handler is not None
     scan_handler = scan_handler or _default_scan
 
     def dependencies_ready() -> bool:
+        """解析 dependencies_available 的布尔/可调用两种形态。"""
         return bool(
             dependencies_available()
             if callable(dependencies_available)
@@ -64,16 +79,31 @@ def register_joystick_routes(
         )
 
     def current_controller():
+        """解析 controller 的实例/getter 两种形态。"""
         return controller() if callable(controller) else controller
 
     def run_operation(body, operation, *, cancel=False):
+        """在用户操作准入上下文内执行操作。
+
+        Returns: (是否被准入接受, 操作结果)。
+        """
+        def admitted_operation():
+            """在准入上下文内执行操作本体。"""
+            owner = current_controller()
+            admission = getattr(owner, "user_operation", None)
+            with admission(request.path.rsplit("/", 1)[-1], body) if admission else nullcontext():
+                return operation()
         if operation_runner is None:
-            return True, operation()
-        return operation_runner(body, operation, cancel=cancel)
+            return True, admitted_operation()
+        return operation_runner(body, admitted_operation, cancel=cancel)
 
     def require_available(handler):
+        """包装 handler：统一处理 OPTIONS 预检与依赖/功能不可用。"""
         @wraps(handler)
         def wrapped(*args, **kwargs):
+            """执行预检与可用性检查后进入原 handler。"""
+            if request.method == "OPTIONS":
+                return _json_response()
             if not dependencies_ready():
                 return _failed("手柄遥操依赖模块不可用")
             joystick_controller = current_controller()
@@ -92,6 +122,7 @@ def register_joystick_routes(
     @app.route("/api/joystick/scan", methods=post_methods)
     @require_available
     def joystick_scan(joystick_controller):
+        """POST/OPTIONS /api/joystick/scan：扫描输入设备并返回候选列表。"""
         try:
             body = request.get_json(silent=True) or {}
             accepted, result = run_operation(
@@ -115,23 +146,33 @@ def register_joystick_routes(
     @app.route("/api/joystick/connect", methods=post_methods)
     @require_available
     def joystick_connect(joystick_controller):
+        """POST/OPTIONS /api/joystick/connect：按 address/name 连接设备。"""
         try:
             body = request.get_json(silent=True) or {}
             address = body.get("address")
             name = body.get("name") or "Unknown"
             if not address:
                 return _failed("设备地址不能为空")
-            accepted, success = run_operation(
+            accepted, result = run_operation(
                 body,
                 lambda: joystick_controller.connect_device(address, name),
             )
             if not accepted:
                 return _failed("桌面请求已失效")
-            if success:
-                return _json_response("连接成功")
-            return _failed(
-                joystick_controller.get_last_error()
-                or "连接失败，请检查设备是否在范围内或设备是否已连接"
+            outcome = result.outcome.value
+            response_body = {"data": {"outcome": outcome}}
+            if outcome == "ready":
+                return _json_response(result.message or "连接成功", body=response_body)
+            if outcome == "pending":
+                return _json_response(result.message or "等待设备连接", body=response_body)
+            return _json_response(
+                msg=(
+                    result.message
+                    or joystick_controller.get_last_error()
+                    or "连接失败，请检查设备是否在范围内或设备是否已连接"
+                ),
+                code=0,
+                body=response_body,
             )
         except Exception as exc:
             logging.exception("[JoystickAPI] Connect failed")
@@ -140,6 +181,7 @@ def register_joystick_routes(
     @app.route("/api/joystick/disconnect", methods=disconnect_methods)
     @require_available
     def joystick_disconnect(joystick_controller):
+        """GET/POST /api/joystick/disconnect：停止会话（GET 走 query，默认 hold）。"""
         try:
             body = request.get_json(silent=True) or {}
             if request.method == "GET":
@@ -158,16 +200,29 @@ def register_joystick_routes(
             )
             if not accepted:
                 return _failed("桌面请求已失效")
+            status_body = {"data": {"status": joystick_controller.get_status()}}
             if success:
-                return _json_response(f"已停止手柄遥操 ({reason})")
-            return _failed("停止手柄遥操失败")
+                return _json_response(
+                    f"已停止手柄遥操 ({reason})",
+                    body=status_body,
+                )
+            return _json_response(
+                msg=joystick_controller.get_last_error() or "停止手柄遥操失败",
+                code=0,
+                body=status_body,
+            )
         except Exception:
             logging.exception("[JoystickAPI] Disconnect failed")
-            return _failed("停止手柄遥操异常")
+            return _json_response(
+                msg="停止手柄遥操异常",
+                code=0,
+                body={"data": {"status": joystick_controller.get_status()}},
+            )
 
     @app.route("/api/joystick/init_arm", methods=post_methods)
     @require_available
     def joystick_init_arm(joystick_controller):
+        """POST/OPTIONS /api/joystick/init_arm：初始化单/双臂与手侧绑定。"""
         try:
             body = request.get_json(silent=True) or {}
             mode = body.get("mode", "single")
@@ -196,7 +251,9 @@ def register_joystick_routes(
             return _failed(f"初始化机械臂失败: {exc}")
 
     def register_value_route(path, endpoint, validator, setter, invalid_message, exception_message):
+        """注册 /api/joystick/* 单值设置路由（校验 body.value 后调用 setter）。"""
         def handler(joystick_controller):
+            """校验 body.value 后调用 setter 并返回统一响应。"""
             try:
                 body = request.get_json(silent=True) or {}
                 value = body.get("value")
@@ -222,22 +279,37 @@ def register_joystick_routes(
         )
 
     register_value_route(
+        # POST/OPTIONS /api/joystick/calibration：设置历史 0-3 标定档位。
         "/api/joystick/calibration",
         "joystick_calibration",
-        lambda value: value is not None and 0 <= value <= 3,
+        lambda value: isinstance(value, int) and not isinstance(value, bool)
+        and 0 <= value <= 3,
         lambda joystick_controller, value: joystick_controller.set_calibration(value),
         "标定值必须在 0-3 之间",
         "设置标定失败",
     )
     register_value_route(
+        # POST/OPTIONS /api/joystick/yaw：设置 -180..180 的整数 yaw 角度。
+        "/api/joystick/yaw",
+        "joystick_yaw",
+        lambda value: isinstance(value, (int, float)) and not isinstance(value, bool)
+        and -180 <= value <= 180 and int(value) == value,
+        lambda joystick_controller, value: joystick_controller.set_yaw(value),
+        "标定角度必须为 -180 到 180 的整数",
+        "设置标定失败",
+    )
+    register_value_route(
+        # POST/OPTIONS /api/joystick/scale：设置 0.1-2.0 灵敏度。
         "/api/joystick/scale",
         "joystick_scale",
-        lambda value: value is not None and 0.1 <= value <= 1.0,
+        lambda value: isinstance(value, (int, float)) and not isinstance(value, bool)
+        and 0.1 <= value <= 2.0,
         lambda joystick_controller, value: joystick_controller.set_scale(value),
-        "灵敏度值必须在 0.1-1.0 之间",
+        "灵敏度值必须在 0.1-2.0 之间",
         "设置灵敏度失败",
     )
     register_value_route(
+        # POST/OPTIONS /api/joystick/view_side：设置查看侧 left/right。
         "/api/joystick/view_side",
         "joystick_view_side",
         lambda value: value in ("left", "right"),
@@ -249,6 +321,7 @@ def register_joystick_routes(
     @app.route("/api/joystick/session_config", methods=post_methods)
     @require_available
     def joystick_session_config(joystick_controller):
+        """POST/OPTIONS /api/joystick/session_config：更新 mode/master_side/view_side/slave_ip。"""
         try:
             body = request.get_json(silent=True) or {}
             accepted, success = run_operation(
@@ -269,6 +342,7 @@ def register_joystick_routes(
 
     @app.route("/api/joystick/status", methods=["GET"])
     def joystick_status():
+        """GET /api/joystick/status：返回可用性与会话状态（不可用也返回 200）。"""
         try:
             if not dependencies_ready():
                 return _json_response(
@@ -288,6 +362,7 @@ def register_joystick_routes(
         @app.route("/api/joystick/confirm_init_position", methods=post_methods)
         @require_available
         def joystick_confirm_init_position(joystick_controller):
+            """POST/OPTIONS /api/joystick/confirm_init_position：确认并记录零点位置。"""
             try:
                 body = request.get_json(silent=True) or {}
                 ip = body.get("ip", "10.42.0.101")
@@ -301,6 +376,7 @@ def register_joystick_routes(
         @app.route("/api/joystick/get_init_position", methods=get_methods)
         @require_available
         def joystick_get_init_position(joystick_controller):
+            """GET/OPTIONS /api/joystick/get_init_position：读取已记录的零点。"""
             try:
                 position = joystick_controller.get_init_position()
                 if position.get("error"):
@@ -313,6 +389,7 @@ def register_joystick_routes(
         @app.route("/api/joystick/get_current_joints", methods=get_methods)
         @require_available
         def joystick_get_current_joints(joystick_controller):
+            """GET/OPTIONS /api/joystick/get_current_joints：读取指定 IP 的当前关节值。"""
             try:
                 ip = request.args.get("ip", "10.42.0.101")
                 joints = joystick_controller.get_current_joints(ip)
@@ -330,14 +407,21 @@ def register_joystick_routes(
     @app.route("/api/joystick/events", methods=get_methods)
     @require_available
     def joystick_events(joystick_controller):
+        """GET/OPTIONS /api/joystick/events：SSE 推送观察帧、心跳与断连终帧。"""
         try:
             connection_id = str(uuid.uuid4())[:8]
 
             def event_stream():
+                """SSE 生成器：序列号变化即推送；空闲超时发心跳；终止帧后结束流。"""
                 last_sequence = -1
                 last_heartbeat = time.time()
                 try:
                     while True:
+                        sequence_reader = getattr(joystick_controller, "get_observation_sequence", None)
+                        if (sequence_reader is not None and sequence_reader() == last_sequence
+                                and time.time() - last_heartbeat <= 3):
+                            time.sleep(0.05)
+                            continue
                         snapshot = joystick_controller.get_observation_snapshot()
                         sequence = snapshot.sequence
                         emit_disconnect = bool(

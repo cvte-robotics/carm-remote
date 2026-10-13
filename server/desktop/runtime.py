@@ -14,6 +14,7 @@ from basic.joystick.end_effectors import EndEffectorFactory
 from basic.joystick.session.arm import build_arm_bindings, desktop_arm_endpoint
 
 from .watchdog import HeartbeatWatchdog
+from basic.joystick.runtime.config import identify_arm_model
 
 
 ARM_PROBE_TIMEOUT = 5.0
@@ -50,13 +51,9 @@ def probe_current_arm(ip: str, timeout: float = ARM_PROBE_TIMEOUT) -> Dict[str, 
             time.sleep(0.05)
         else:
             raise RuntimeError("读取机械臂型号超时")
-        upper_name = arm_name.upper()
-        if "A3" in upper_name and arm_dof == 6:
-            family, allowed_profiles = "A3", ["a3_single", "a3_dual"]
-        elif "D3" in upper_name and arm_dof == 7:
-            family, allowed_profiles = "D3", ["d3_dual"]
-        else:
-            raise RuntimeError(f"不支持的机械臂型号: {arm_name} ({arm_dof}DOF)")
+        model = identify_arm_model(arm_name, arm_dof)
+        family = "D3" if model == "D3" else "A3"
+        allowed_profiles = ["d3_dual"] if family == "D3" else ["a3_single", "a3_dual"]
         return {"ip": address, "arm_name": arm_name, "arm_dof": arm_dof, "family": family, "allowed_profiles": allowed_profiles}
     finally:
         if carm is not None:

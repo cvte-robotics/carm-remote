@@ -1,3 +1,8 @@
+"""Quest control v2 协议的 TCP/NDJSON 接收器（严格状态机）。
+
+任何协议违规都发 ``protocol_error`` 并断开；发送侧经队列异步排空，不阻塞 I/O 线程。
+"""
+
 import json
 import logging
 import math
@@ -12,8 +17,14 @@ from .constants import (
     QUEST_PROTOCOL_PREFIX, QUEST_LINE_LIMIT, QUEST_SEND_QUEUE_LIMIT,
     QUEST_PROTOCOL_VERSION, QUEST_HANDSHAKE_TIMEOUT, QUEST_RX_TIMEOUT,
 )
+
+
 class QuestTcpReceiver:
-    """严格实现 Quest control v2 的 TCP/NDJSON 接收器。"""
+    """严格实现 Quest control v2 的 TCP/NDJSON 接收器。
+
+    单实例可接受多轮客户端连接（每轮递增 ``connection_generation``）。``stop``
+    在线程仍存活时返回 False，由调用方重试。
+    """
 
     def __init__(
         self,
@@ -51,10 +62,17 @@ class QuestTcpReceiver:
 
     @property
     def connection_generation(self) -> int:
+        """返回当前连接 generation（线程安全；每次 accept 递增）。"""
         with self._connection_lock:
             return self._connection_generation
 
     def start(self):
+        """绑定监听端口并启动 I/O 线程（先确保旧线程已停止）。
+
+        Raises:
+            RuntimeError: 上一个 receiver 线程尚未停止。
+            OSError: 端口绑定/监听失败。
+        """
         if self._running:
             return
         if self.stop() is False:
@@ -73,6 +91,11 @@ class QuestTcpReceiver:
         self._thread.start()
 
     def stop(self) -> bool:
+        """停止接收器并回收线程与 socket。
+
+        Returns:
+            True 表示线程已停止；False 表示线程仍存活，需重试。
+        """
         self._running = False
         self._connected = False
         current_thread = threading.current_thread()
@@ -109,6 +132,7 @@ class QuestTcpReceiver:
         return thread_stopped
 
     def _clear_send_queue(self):
+        """丢弃队列中尚未发出的控制帧（新连接/停止时重置控制通道）。"""
         while True:
             try:
                 self._send_queue.get_nowait()
@@ -116,13 +140,20 @@ class QuestTcpReceiver:
                 return
 
     def _notify(self, callback, *args):
+        """调用单个回调（回调内部异常由调用点自行隔离）。"""
         callback(*args)
 
     def _notify_status(self, status, generation):
+        """向 status_callback 上报协议状态（未注册时静默忽略）。"""
         if self.status_callback:
             self._notify(self.status_callback, status, generation)
 
     def _queue_control(self, payload: Dict[str, Any]) -> bool:
+        """把一条控制帧入队。
+
+        Returns:
+            True 表示已入队；队列满时返回 False。
+        """
         try:
             self._send_queue.put_nowait(payload)
             return True
@@ -131,6 +162,11 @@ class QuestTcpReceiver:
             return False
 
     def _flush_send_queue(self, client):
+        """把队列中所有控制帧写入客户端。
+
+        Returns:
+            True 表示队列已排空；无客户端或写入失败时返回 False。
+        """
         if client is None:
             return False
         while True:
@@ -150,6 +186,17 @@ class QuestTcpReceiver:
 
     @staticmethod
     def _decode_record(raw: bytes):
+        """解码一行 NDJSON 记录。
+
+        Args:
+            raw: 去掉换行后的一行字节。
+
+        Returns:
+            (是否控制帧, payload dict)；控制帧以 QUEST_PROTOCOL_PREFIX 开头。
+
+        Raises:
+            ValueError: 行过长、JSON 非法或控制帧缺少 type 字段。
+        """
         if len(raw) > QUEST_LINE_LIMIT:
             raise ValueError("line_too_long")
         text = raw.decode("utf-8")
@@ -164,6 +211,11 @@ class QuestTcpReceiver:
 
     @staticmethod
     def _is_valid_pose_payload(payload: Dict[str, Any]) -> bool:
+        """校验一帧 pose 数据的字段齐备性与数值合法性。
+
+        Returns:
+            True 表示可作为合法输入交给上层。
+        """
         if "type" in payload:
             return False
         timestamp = payload.get("ts")
@@ -217,10 +269,19 @@ class QuestTcpReceiver:
         )
 
     def _send_protocol_error(self, code: str) -> bool:
+        """把一条 protocol_error 控制帧入队。"""
         return self._queue_control({"type": "protocol_error", "code": code})
 
     def send_session_end(self, reason: str = "backend_stop", fatal: bool = True) -> bool:
-        """在本地清理前直接写入会话结束通知。"""
+        """在本地清理之前直接写入会话结束通知。
+
+        Args:
+            reason: 结束原因。
+            fatal: 是否为致命结束。
+
+        Returns:
+            True 表示已写入 socket；未连接或写入失败时返回 False。
+        """
         client = self._client_socket
         if not self._connected or client is None:
             return False
@@ -238,6 +299,7 @@ class QuestTcpReceiver:
             return False
 
     def _run(self):
+        """I/O 线程主循环：accept → 握手 → 收帧 → 断开并通知。"""
         try:
             while self._running:
                 server_socket = self._server_socket
@@ -452,10 +514,7 @@ class QuestTcpReceiver:
                 self._notify_status("ListenerFailed", generation)
             except Exception:
                 logging.exception("[QuestTcpReceiver] Listener failure status callback failed")
-            # `disconnect_notified` belongs to the previous client connection.
-            # A listener failure is a new terminal event and must still reach
-            # the session owner even when that previous connection already
-            # reported its own disconnect.
+            # listener 失败是新事件，即使旧连接已上报断开也要送达会话持有者。
             if was_running:
                 self.disconnect_notified = True
                 try:
@@ -467,4 +526,5 @@ class QuestTcpReceiver:
 
     @staticmethod
     def _is_strict_int(value) -> bool:
+        """严格整数判定（排除 bool，供 seq/protocol/connection_seq 校验）。"""
         return isinstance(value, int) and not isinstance(value, bool)

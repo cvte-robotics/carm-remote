@@ -1,4 +1,8 @@
-"""Joystick public facade."""
+"""Joystick 公开 facade。
+
+对外暴露 JoystickController、依赖可用标记（DEPENDENCIES_AVAILABLE）与
+Carm SDK 封装类；导入前先装配 Quest 输入模块的 import 路径。
+"""
 
 from .runtime.paths import setup_import_paths as _setup_import_paths
 
@@ -11,17 +15,4 @@ __all__ = [
     "Carm",
     "DEPENDENCIES_AVAILABLE",
     "JoystickController",
-    "get_joystick_controller",
-    "joystick_controller",
 ]
-
-joystick_controller = None
-
-
-def get_joystick_controller(end_effector_factory=None):
-    global joystick_controller
-    if joystick_controller is None:
-        joystick_controller = JoystickController(
-            end_effector_factory=end_effector_factory,
-        )
-    return joystick_controller

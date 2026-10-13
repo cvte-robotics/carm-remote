@@ -1,10 +1,14 @@
-"""Quest-specific input policy with no host, Carm, or transport ownership."""
+"""Quest 专用输入 policy：只推进帧语义（jump 检测、rebase pin、frame barrier）。
+
+资源与生命周期全部由 module/receiver 层持有。
+"""
 
 import math
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Tuple
 
 from carm_teleop_input_contracts import (
+    BaseSourceControlPolicy,
     ControlAction,
     ControlCompletion,
     ControlContext,
@@ -14,23 +18,38 @@ from carm_teleop_input_contracts import (
     HAND_LEFT,
     HAND_RIGHT,
     PolicyDispatchContext,
+    RebasePayload,
 )
 
 
 @dataclass(frozen=True)
 class _QuestRebasePin:
+    """一次待执行的 rebase 请求（不可变快照）。
+
+    pin 在创建时冻结当时的 session、epoch、receiver generation 与 raw pose；Host
+    确认 pin 仍然匹配后才会把它作为 RebasePayload 下发。任何失效路径必须换掉或
+    清空 ``_QuestHandJumpState.pin``。
+    """
+
     jump_epoch: int
     frame_index: int
     raw_pose: Tuple[float, ...]
-    input_generation: int
+    session_id: int
     receiver_generation: int
-    control_generation: int
-    controller_generation: int
+    params_epoch: int
     reason: str
 
 
 @dataclass
 class _QuestHandJumpState:
+    """
+单手位在 Quest 帧序列上的可变状态。
+
+``jump_epoch``/``required_epoch``/``handled_jump_epoch`` 构成 jump 事件生命周期
+（required == handled 表示无未处理跳变）；``comparison_pose`` 是下次 jump 检测
+基准；``rebase_sequence``/``last_handled_fi`` 构成"该帧不得再次下发"屏障。
+"""
+
     comparison_pose: Optional[Tuple[float, ...]] = None
     latest_valid_pose: Optional[Tuple[float, ...]] = None
     latest_valid_fi: Optional[int] = None
@@ -43,14 +62,22 @@ class _QuestHandJumpState:
     deferred_unlock_rebase: bool = False
     rotation_locked: bool = False
     controller_identity: Optional[object] = None
-    controller_generation: int = 0
     handled_jump_epoch: int = 0
     rebase_sequence: Optional[int] = None
     last_handled_fi: Optional[int] = None
+    # 当前帧唯一活跃 token：校验比较对象身份，每条失效路径必须丢掉该引用，
+    # 帧绑定未变时复用同一对象。
+    issued_token: Optional["QuestSourceToken"] = None
 
 
 @dataclass(frozen=True)
 class QuestFrameContext:
+    """同一帧内单手位的输入快照（由 module 从 RawInputBatch 组装）。
+
+    ``raw_pose`` 是 policy 归一化后的 pose（位姿无效时为 None），``bound_active``
+    表示该手当前已绑定 controller。
+    """
+
     hand: str
     frame_index: int
     pose_valid: bool
@@ -62,6 +89,13 @@ class QuestFrameContext:
 
 @dataclass(frozen=True)
 class QuestFrameDecision:
+    """policy 对单帧单手位的决策，由 module 转成 InputUpdateDecision。
+
+    ``controller`` 是决策时该手绑定的 controller；``invalidate_controller`` 表示
+    本帧产生了新 pin（需先重取位姿），``reject_controller`` 表示本帧没有带来新的
+    有效位姿、必须拒绝该 controller 的控制。
+    """
+
     hand: str
     accept_pose: bool
     controller: Optional[object]
@@ -74,16 +108,26 @@ class QuestFrameDecision:
 
 @dataclass(frozen=True)
 class QuestSourceToken:
+    """
+policy 私有的帧身份（模块外不透明）：派发校验按对象身份比较，字段只记录铸造
+时的帧绑定，供 ``prepare_control`` 判断未变帧可否沿用同一对象。session 语义由
+对象身份覆盖（session 变化会清空本 policy 状态）。
+"""
+
     jump_epoch: int
     frame_index: int
-    input_generation: int
     receiver_generation: int
-    control_generation: int
-    controller_generation: int
 
 
 @dataclass(frozen=True)
 class QuestControlDecision:
+    """一次 ``prepare_control`` 的结果。
+
+    ``pin`` 非 None 表示需要 Host 先执行 rebase，``pin_matches`` 表示该 pin 与当前
+    session/epoch/receiver generation/jump epoch 一致；``ready`` 表示可直接下发，
+    此时 ``source_token`` 为 policy 私有的 frame token。
+    """
+
     pin: Optional[_QuestRebasePin]
     pin_matches: bool
     ready: bool
@@ -91,6 +135,15 @@ class QuestControlDecision:
 
 
 def _quest_pose_values(pose):
+    """把 pose 映射归一化为 (x, y, z, 单位四元数)。
+
+    Args:
+        pose: 含 x/y/z/qx/qy/qz/qw 的映射。
+
+    Returns:
+        7 元 tuple，后半段四元数已归一化；任一字段不是有限数值，或四元数模长
+        近似为 0 时返回 None。
+    """
     values = tuple(pose.get(key) for key in ("x", "y", "z", "qx", "qy", "qz", "qw"))
     if any(
         isinstance(value, bool)
@@ -113,6 +166,19 @@ def _quest_pose_jump(
     rotation_threshold_deg,
     rotation_locked,
 ):
+    """比较两个已归一化 pose，判定是否发生 jump。
+
+    Args:
+        previous_pose: 上一次接受的归一化 pose。
+        current_pose: 本帧归一化 pose。
+        position_threshold_m: 位置跳变阈值（米）。
+        rotation_threshold_deg: 旋转跳变阈值（度）。
+        rotation_locked: 为 True 时忽略旋转跳变。
+
+    Returns:
+        (是否 jump, 位置位移, 旋转角度) 三元组；旋转角取自四元数点积的绝对值，
+        因此不区分四元数整体符号翻转。
+    """
     position_delta = math.sqrt(
         sum((current_pose[index] - previous_pose[index]) ** 2 for index in range(3))
     )
@@ -127,8 +193,8 @@ def _quest_pose_jump(
     return position_jump or rotation_jump, position_delta, rotation_delta_deg
 
 
-class QuestInputPolicy:
-    """Own every mutable Quest jump, pin, and frame-barrier transition."""
+class QuestInputPolicy(BaseSourceControlPolicy):
+    """持有全部 Quest jump、pin 与 frame barrier 状态迁移。"""
 
     def __init__(self):
         self.__hand_states: Dict[str, _QuestHandJumpState] = self._new_hand_states()
@@ -137,18 +203,21 @@ class QuestInputPolicy:
 
     @staticmethod
     def _new_hand_states() -> Dict[str, _QuestHandJumpState]:
+        """新建双手的空白状态表。"""
         return {
             HAND_LEFT: _QuestHandJumpState(),
             HAND_RIGHT: _QuestHandJumpState(),
         }
 
     def reset(self) -> None:
+        """丢弃全部手的 jump/pin/token 状态与帧屏障，回到初始状态。"""
         self.__hand_states.clear()
         self.__hand_states.update(self._new_hand_states())
         self.__frame_receiver_generation = None
         self.__last_frame_index = None
 
     def owned_controllers(self) -> List[object]:
+        """返回当前仍被任一手的状态引用的 controller（去重、保持发现顺序）。"""
         controllers = []
         for hand_state in self.__hand_states.values():
             controller = hand_state.controller_identity
@@ -157,81 +226,118 @@ class QuestInputPolicy:
         return controllers
 
     def controller_for_hand(self, hand: str) -> Optional[object]:
+        """返回某只手当前绑定的 controller；未绑定返回 None。"""
         return self.__hand_states[hand].controller_identity
 
     def controller_matches(self, hand: str, controller: object) -> bool:
+        """按对象身份判断某只手是否正绑定给定 controller。"""
         return self.__hand_states[hand].controller_identity is controller
 
     def bind_controller(
         self,
         hand: str,
         controller: object,
-        controller_generation: int,
-        input_generation: int,
-        control_generation: int,
+        session_id: int,
+        params_epoch: int,
     ) -> Optional[object]:
+        """
+绑定一手位的 controller（替换旧绑定），同时视为一次失效事件：立即为该手
+请求 rebase，并把未完成的 pin 重绑到新 params_epoch。
+
+Args:
+    hand: 目标手。
+    controller: 新 controller。
+    session_id: 当前 Host 会话身份。
+    params_epoch: 当前参数发布 epoch。
+
+Returns:
+    被替换掉的旧 controller；此前未绑定时为 None。
+"""
         state = self.__hand_states[hand]
         previous = state.controller_identity
         state.controller_identity = controller
-        state.controller_generation = controller_generation
         self.request_rebase(
             hand,
             "controller_replacement",
-            input_generation,
-            control_generation,
+            session_id,
+            params_epoch,
         )
-        # control_generation is global across both hands. Preserve the old
-        # contract by rebinding every outstanding pin to the new generation.
-        self.refresh_pins(control_generation)
+        # 参数发布是 Host 全局的、同时作用于双手。为保持旧契约，这里把所有未完成的
+        # pin 重新绑定到新的 params_epoch。
+        self.refresh_pins(params_epoch)
         return previous
 
     def release_controller(
         self,
         hand: str,
         controller: object,
-        control_generation: int,
+        params_epoch: int,
     ) -> bool:
+        """
+解除一手位的 controller 绑定（仅当传入 controller 仍是当前绑定才生效）。
+
+生效时丢弃该手的 pin 与已发出 token，并把其余 pin 重绑到新 params_epoch。
+
+Args:
+    hand: 目标手。
+    controller: 期望被解绑的 controller。
+    params_epoch: 当前参数发布 epoch。
+
+Returns:
+    已解绑为 True；绑定不符时为 False（保持原状）。
+"""
         state = self.__hand_states[hand]
         if state.controller_identity is not controller:
             return False
         state.controller_identity = None
-        state.controller_generation = 0
         state.pin = None
         state.latest_frame_new_valid = False
-        self.refresh_pins(control_generation)
+        state.issued_token = None
+        self.refresh_pins(params_epoch)
         return True
 
     def build_pin(
         self,
         hand_state: _QuestHandJumpState,
         reason: str,
-        input_generation: int,
-        control_generation: int,
+        session_id: int,
+        params_epoch: int,
         receiver_generation: Optional[int] = None,
     ) -> Optional[_QuestRebasePin]:
+        """为一次 rebase 构造 pin 快照。
+
+        Args:
+            hand_state: 目标手的当前状态。
+            reason: pin 原因（会随 RebasePayload 一起交给 Host）。
+            session_id: 当前 Host 会话身份。
+            params_epoch: 当前参数发布 epoch。
+            receiver_generation: 传输 generation；None 表示取该手最新观测值（无则为 0）。
+
+        Returns:
+            不可变 pin；若尚无可用位姿或该手未绑定 controller 则返回 None。
+        """
         if (
             hand_state.latest_valid_pose is None
             or hand_state.latest_valid_fi is None
             or hand_state.controller_identity is None
-            or hand_state.controller_generation <= 0
         ):
             return None
         return _QuestRebasePin(
             jump_epoch=hand_state.required_epoch,
             frame_index=hand_state.latest_valid_fi,
             raw_pose=hand_state.latest_valid_pose,
-            input_generation=input_generation,
+            session_id=session_id,
             receiver_generation=(
                 receiver_generation
                 if receiver_generation is not None
                 else hand_state.latest_receiver_generation or 0
             ),
-            control_generation=control_generation,
-            controller_generation=hand_state.controller_generation,
+            params_epoch=params_epoch,
             reason=reason,
         )
 
-    def refresh_pins(self, control_generation: int) -> None:
+    def refresh_pins(self, params_epoch: int) -> None:
+        """把所有未完成 pin 重新绑定到新的 params_epoch（其余字段不变）。"""
         for hand_state in self.__hand_states.values():
             pin = hand_state.pin
             if pin is None:
@@ -240,10 +346,9 @@ class QuestInputPolicy:
                 jump_epoch=pin.jump_epoch,
                 frame_index=pin.frame_index,
                 raw_pose=pin.raw_pose,
-                input_generation=pin.input_generation,
+                session_id=pin.session_id,
                 receiver_generation=pin.receiver_generation,
-                control_generation=control_generation,
-                controller_generation=pin.controller_generation,
+                params_epoch=params_epoch,
                 reason=pin.reason,
             )
 
@@ -251,34 +356,69 @@ class QuestInputPolicy:
         self,
         hand: str,
         reason: str,
-        input_generation: int,
-        control_generation: int,
+        session_id: int,
+        params_epoch: int,
         receiver_generation: Optional[int] = None,
     ) -> None:
+        """
+发起一次 rebase 请求（使当前帧 token 全部失效）：递增 jump_epoch、清空已发出
+token 并尝试构造 pin；无 pin 时由后续帧重试补齐。
+
+Args:
+    hand: 目标手。
+    reason: 本次 rebase 的原因。
+    session_id: 当前 Host 会话身份。
+    params_epoch: 当前参数发布 epoch。
+    receiver_generation: 本次请求所属的传输 generation。
+"""
         state = self.__hand_states[hand]
         state.jump_epoch += 1
         state.required_epoch = state.jump_epoch
+        # rebase 请求即是失效事件：任何为上一 epoch 发出的 token 都必须停止校验，
+        # 即使该 jump epoch 可能因为同一个 frame index 被重新铸造。
+        state.issued_token = None
         state.pin = self.build_pin(
             state,
             reason,
-            input_generation,
-            control_generation,
+            session_id,
+            params_epoch,
             receiver_generation,
         )
 
     @staticmethod
     def normalize_pose(pose):
+        """把 pose 映射归一化为 ``_quest_pose_values`` 的 7 元 tuple（非法时 None）。"""
         return _quest_pose_values(pose)
 
     def process_frame(
         self,
         contexts: Iterable[QuestFrameContext],
-        input_generation: int,
-        control_generation: int,
+        session_id: int,
+        params_epoch: int,
         receiver_generation: int,
         position_threshold_m: float,
         rotation_threshold_deg: float,
     ) -> Tuple[QuestFrameDecision, ...]:
+        """
+推进一帧的双手状态并产出逐手决策。
+
+帧屏障：同一 receiver generation 内不递增的重复帧返回空 tuple，generation 变化
+则无条件重新开始。
+
+Args:
+    contexts: 同一帧内每个手位的输入快照，必须来自同一个 frame index。
+    session_id: 当前 Host 会话身份。
+    params_epoch: 当前参数发布 epoch。
+    receiver_generation: 本帧所属传输 generation。
+    position_threshold_m: 位置 jump 阈值。
+    rotation_threshold_deg: 旋转 jump 阈值。
+
+Returns:
+    与 ``contexts`` 同序的逐手决策；重复帧返回空 tuple。
+
+Raises:
+    ValueError: ``contexts`` 含多个 frame index，或标记为有效的位姿不可用。
+"""
         contexts = tuple(contexts)
         frame_indices = {context.frame_index for context in contexts}
         if len(frame_indices) != 1:
@@ -339,8 +479,8 @@ class QuestInputPolicy:
                         self.request_rebase(
                             context.hand,
                             "pose_jump",
-                            input_generation,
-                            control_generation,
+                            session_id,
+                            params_epoch,
                             receiver_generation,
                         )
                     elif state.deferred_unlock_rebase and context.bound_active:
@@ -348,8 +488,8 @@ class QuestInputPolicy:
                         self.request_rebase(
                             context.hand,
                             "rotation_unlock",
-                            input_generation,
-                            control_generation,
+                            session_id,
+                            params_epoch,
                             receiver_generation,
                         )
                     elif (
@@ -360,16 +500,16 @@ class QuestInputPolicy:
                         state.pin = self.build_pin(
                             state,
                             "receiver_reconnect" if receiver_changed else "deferred_rebase",
-                            input_generation,
-                            control_generation,
+                            session_id,
+                            params_epoch,
                             receiver_generation,
                         )
                     elif receiver_changed and controller is not None:
                         self.request_rebase(
                             context.hand,
                             "receiver_reconnect",
-                            input_generation,
-                            control_generation,
+                            session_id,
+                            params_epoch,
                             receiver_generation,
                         )
 
@@ -395,11 +535,17 @@ class QuestInputPolicy:
         return tuple(decisions)
 
     def mark_disconnected(self) -> Tuple[object, ...]:
+        """输入断链：清空 pin、token 与帧有效性，并推进双手 jump epoch。
+
+        Returns:
+            断链前本 policy 持有的全部 controller，供 Host 使映射失效。
+        """
         controllers = tuple(self.owned_controllers())
         for state in self.__hand_states.values():
             state.latest_frame_pose_valid = False
             state.latest_frame_new_valid = False
             state.pin = None
+            state.issued_token = None
             state.deferred_unlock_rebase = False
             state.rotation_locked = False
             state.jump_epoch += 1
@@ -410,9 +556,20 @@ class QuestInputPolicy:
         self,
         reason: str,
         active_hands: Iterable[str],
-        input_generation: int,
-        control_generation: int,
+        session_id: int,
+        params_epoch: int,
     ) -> Tuple[object, ...]:
+        """映射（mode/master_side/手位）变化时，为每只已绑定的手请求 rebase。
+
+        Args:
+            reason: 本次映射变化的原因，直接作为 pin reason。
+            active_hands: 需要处理的 hand 集合；未绑定的手跳过。
+            session_id: 当前 Host 会话身份。
+            params_epoch: 当前参数发布 epoch。
+
+        Returns:
+            被本次变化影响到的 controller（去重、保持发现顺序）。
+        """
         controllers = []
         for hand in active_hands:
             controller = self.__hand_states[hand].controller_identity
@@ -421,8 +578,8 @@ class QuestInputPolicy:
             self.request_rebase(
                 hand,
                 reason,
-                input_generation,
-                control_generation,
+                session_id,
+                params_epoch,
             )
             if controller not in controllers:
                 controllers.append(controller)
@@ -432,18 +589,34 @@ class QuestInputPolicy:
         self,
         hand: str,
         controller: object,
-        controller_generation: int,
-        input_generation: int,
-        control_generation: int,
+        session_id: int,
+        params_epoch: int,
         bound_active: bool,
         need_sync_feedback: bool,
     ) -> QuestControlDecision:
+        """
+汇总一次控制决策所需的全部状态判断（先处理需 rebase 的 sync feedback）。
+
+``ready`` 要求绑定生效、无 pin、无未处理 jump epoch、有新有效位姿且该帧未被
+rebase/派发过；只有 ready 时才铸造/复用 token。
+
+Args:
+    hand: 目标手。
+    controller: Host 当前认为该手绑定的 controller。
+    session_id: 当前 Host 会话身份。
+    params_epoch: 当前参数发布 epoch。
+    bound_active: 该手在 Host 侧是否处于已绑定状态。
+    need_sync_feedback: Host 是否要求重新同步 feedback。
+
+Returns:
+    本轮的 pin/pin_matches/ready 与可选 token。
+"""
         state = self.__hand_states[hand]
         gate = bool(
-            bound_active
-            and state.controller_identity is controller
-            and state.controller_generation == controller_generation
+            bound_active and state.controller_identity is controller
         )
+        # ``gate`` 也是 token 身份中 controller 的那一半：token 只在该绑定成立时才会
+        # 在下面被铸造/复用，而 bind_controller/release_controller 会失效该引用。
         if (
             gate
             and state.pin is None
@@ -454,17 +627,16 @@ class QuestInputPolicy:
             self.request_rebase(
                 hand,
                 "pose_mapping_invalidated",
-                input_generation,
-                control_generation,
+                session_id,
+                params_epoch,
                 state.latest_receiver_generation,
             )
         pin = state.pin if gate else None
         pin_matches = bool(
             pin
-            and pin.input_generation == input_generation
+            and pin.session_id == session_id
             and pin.receiver_generation == state.latest_receiver_generation
-            and pin.control_generation == control_generation
-            and pin.controller_generation == controller_generation
+            and pin.params_epoch == params_epoch
             and pin.jump_epoch == state.required_epoch
         )
         ready = bool(
@@ -479,14 +651,7 @@ class QuestInputPolicy:
         )
         source_token = None
         if ready:
-            source_token = QuestSourceToken(
-                jump_epoch=state.required_epoch,
-                frame_index=state.latest_valid_fi,
-                input_generation=input_generation,
-                receiver_generation=state.latest_receiver_generation,
-                control_generation=control_generation,
-                controller_generation=state.controller_generation,
-            )
+            source_token = self.issue_source_token(state)
         return QuestControlDecision(
             pin=pin,
             pin_matches=pin_matches,
@@ -494,13 +659,46 @@ class QuestInputPolicy:
             source_token=source_token,
         )
 
+    def issue_source_token(
+        self,
+        state: _QuestHandJumpState,
+    ) -> QuestSourceToken:
+        """
+返回当前帧唯一的活跃 token 并原地复用：72Hz 决策多次命中同一帧时必须交出同一
+对象；只有帧绑定移动（frame index / jump epoch / receiver generation）时才铸造
+新对象。
+"""
+        token = state.issued_token
+        if (
+            token is None
+            or token.jump_epoch != state.required_epoch
+            or token.frame_index != state.latest_valid_fi
+            or token.receiver_generation != state.latest_receiver_generation
+        ):
+            token = QuestSourceToken(
+                jump_epoch=state.required_epoch,
+                frame_index=state.latest_valid_fi,
+                receiver_generation=state.latest_receiver_generation,
+            )
+            state.issued_token = token
+        return token
+
     def decide_control(self, context: ControlContext) -> ControlDecision:
+        """
+把 ``prepare_control`` 的结果翻译为中立的 ControlDecision：pin 不匹配 REJECT、
+匹配 REBASE；无 pin 未 ready REJECT；否则 READY 并携带本帧 source token。
+
+Args:
+    context: Host 冻结的样本。
+
+Returns:
+    REJECT / REBASE / READY 三选一的决策。
+"""
         decision = self.prepare_control(
             context.hand,
             context.controller,
-            context.controller_generation,
-            context.input_generation,
-            context.control_generation,
+            context.session_id,
+            context.params_epoch,
             context.bound_active,
             context.need_sync_feedback,
         )
@@ -511,13 +709,24 @@ class QuestInputPolicy:
                 ControlAction.REBASE,
                 decision.pin,
                 "pose_mapping_invalidated",
-                decision.pin.raw_pose,
+                rebase_payload=RebasePayload(decision.pin.raw_pose, decision.pin.reason),
             )
         if not decision.ready:
             return ControlDecision(ControlAction.REJECT, None, "input_not_ready")
         return ControlDecision(ControlAction.READY, decision.source_token, "ready")
 
     def complete_control(self, completion: ControlCompletion) -> ControlResult:
+        """
+Host 回报结果后判定"提交"还是"过期"：REBASE_APPLIED 走 ``commit_rebase``、
+DISPATCH_COMMITTED 走 ``commit_dispatch``，未提交改写为 STALE；DISPATCH_REJECTED
+触发一次 ``reject_dispatch`` 并原样返回。
+
+Args:
+    completion: 原尝试身份（含 controller/session/epoch）与 Host 的实际结果。
+
+Returns:
+    policy 复核后的最终结果。
+"""
         context = completion.context
         result = completion.result
         token = result.source_token
@@ -532,10 +741,9 @@ class QuestInputPolicy:
             committed = token is not None and self.commit_dispatch(
                 context.hand,
                 context.controller,
-                context.controller_generation,
                 token,
-                context.input_generation,
-                context.control_generation,
+                context.session_id,
+                context.params_epoch,
             )
             return ControlResult(
                 result.outcome if committed else ControlOutcome.STALE,
@@ -545,18 +753,30 @@ class QuestInputPolicy:
         if result.outcome is ControlOutcome.DISPATCH_REJECTED:
             self.reject_dispatch(
                 context.hand,
-                context.input_generation,
-                context.control_generation,
+                context.session_id,
+                context.params_epoch,
                 token,
             )
         return result
 
     def commit_rebase(self, hand: str, pin: _QuestRebasePin) -> bool:
+        """
+提交一次已生效的 rebase：仅当 pin 仍是当前 pin 才生效；清空 pin 与已发出
+token，并把 pin 帧记为已处理（不得再派发）。
+
+Args:
+    hand: 目标手。
+    pin: Host 回报已应用的 pin。
+
+Returns:
+    提交成功为 True；pin 已被更新失效事件取代为 False。
+"""
         state = self.__hand_states[hand]
         if state.pin is not pin:
             return False
         state.pin = None
         state.latest_frame_new_valid = False
+        state.issued_token = None
         state.handled_jump_epoch = pin.jump_epoch
         state.rebase_sequence = pin.frame_index
         state.last_handled_fi = pin.frame_index
@@ -566,21 +786,26 @@ class QuestInputPolicy:
         self,
         hand: str,
         controller: object,
-        controller_generation: int,
         source_token: Optional[QuestSourceToken],
-        input_generation: int,
-        control_generation: int,
+        session_id: int,
+        params_epoch: int,
         require_current_frame: bool = True,
     ) -> bool:
+        """
+校验一个已冻结的 Quest token；token 对 policy 不透明。
+
+session/epoch 由 Host 在调用前比对，签名保留仅满足契约。发送前/admit
+（require_current_frame=True）要求 token 是精确当前帧；发送后提交只拒绝
+jump/rebase/disconnect 类失效（不对称是故意保留的）。
+"""
         if source_token is None:
             return False
         state = self.__hand_states[hand]
         return bool(
-            state.controller_identity is controller
-            and state.controller_generation == controller_generation
-            and source_token.controller_generation == controller_generation
-            and source_token.input_generation == input_generation
-            and source_token.control_generation == control_generation
+            # 对象身份取代了六字段相等链：该对象仍是当前帧发出的那个 token，因为
+            # 每条失效路径都会清空 state.issued_token。
+            state.issued_token is source_token
+            and state.controller_identity is controller
             and state.pin is None
             and state.required_epoch == state.handled_jump_epoch == source_token.jump_epoch
             and state.latest_frame_pose_valid
@@ -597,13 +822,13 @@ class QuestInputPolicy:
         )
 
     def validate_dispatch(self, context: PolicyDispatchContext) -> bool:
+        """按 Host 冻结的派发尝试调用 ``_validate_dispatch``（含帧新鲜度要求）。"""
         return self._validate_dispatch(
             context.hand,
             context.controller,
-            context.controller_generation,
             context.source_token,
-            context.input_generation,
-            context.control_generation,
+            context.session_id,
+            context.params_epoch,
             require_current_frame=context.require_current_frame,
         )
 
@@ -611,18 +836,30 @@ class QuestInputPolicy:
         self,
         hand: str,
         controller: object,
-        controller_generation: int,
         source_token: QuestSourceToken,
-        input_generation: int,
-        control_generation: int,
+        session_id: int,
+        params_epoch: int,
     ) -> bool:
+        """
+提交一次已下发的派发：以发送后语义（``require_current_frame=False``）复核
+token；通过后该 frame index 不得再被派发。
+
+Args:
+    hand: 目标手。
+    controller: 派发时的 controller。
+    source_token: 冻结的 token。
+    session_id: 派发时的 Host 会话身份。
+    params_epoch: 派发时的参数 epoch。
+
+Returns:
+    已提交为 True；被失效事件拒绝为 False。
+"""
         if not self._validate_dispatch(
             hand,
             controller,
-            controller_generation,
             source_token,
-            input_generation,
-            control_generation,
+            session_id,
+            params_epoch,
             require_current_frame=False,
         ):
             return False
@@ -634,15 +871,16 @@ class QuestInputPolicy:
     def reject_dispatch(
         self,
         hand: str,
-        input_generation: int,
-        control_generation: int,
+        session_id: int,
+        params_epoch: int,
         source_token: Optional[QuestSourceToken],
     ) -> None:
+        """Host 拒绝一次派发时，为该手请求一次 rebase（dispatch_rejected）。"""
         self.request_rebase(
             hand,
             "dispatch_rejected",
-            input_generation,
-            control_generation,
+            session_id,
+            params_epoch,
             (
                 source_token.receiver_generation
                 if source_token is not None

@@ -1,4 +1,4 @@
-"""Behavior-equivalent adapter for Carm-native flange, gripper and hand."""
+"""Carm 原生法兰/夹爪/灵巧手（flange/gripper/hand）的行为等价适配器。"""
 
 import math
 
@@ -6,6 +6,8 @@ from . import EndEffectorBase, EndEffectorContext
 
 
 class CarmEndEffector(EndEffectorBase):
+    """把 provider 归一化 trigger 映射为 Carm 原生 end-effector 位置指令。"""
+
     NAME = "carm"
     DEFAULT_TORQUE = 25.0
 
@@ -14,6 +16,10 @@ class CarmEndEffector(EndEffectorBase):
         context: EndEffectorContext,
         **options,
     ) -> None:
+        """读取 Carm end-effector 类型与限位配置，预计算速度/力矩参数。
+
+        Raises: RuntimeError 配置缺失或字段非法，或 SDK 不支持所需接口。
+        """
         super().__init__(context, **options)
         self._type = self._read_end_effector_type()
         self._dof = 0
@@ -58,12 +64,14 @@ class CarmEndEffector(EndEffectorBase):
             raise RuntimeError("current Carm SDK does not provide set_eeff")
 
     def _read_end_effector_type(self) -> str:
+        """读取并规范化 Carm SDK 暴露的 end-effector 类型。"""
         raw_type = getattr(self.carm, "end_effector_type", None)
         if callable(raw_type):
             raw_type = raw_type()
         return str(getattr(raw_type, "value", raw_type) or "").strip().lower()
 
     def _read_vector(self, config: dict, key: str, allow_negative: bool = False):
+        """读取按 dof 截断的数值向量配置，可选允许负值。"""
         values = config.get(key)
         if not isinstance(values, (list, tuple)) or len(values) < self._dof:
             raise RuntimeError("Carm end-effector configuration has invalid %s" % key)
@@ -78,6 +86,12 @@ class CarmEndEffector(EndEffectorBase):
         return tuple(normalized)
 
     def set_eff(self, trigger: int) -> bool:
+        """把 provider 归一化 trigger 映射为 Carm 原生位置并下发。
+
+        Args: trigger 为 provider 归一化后的触发值（按 0-127 归一化）。
+        Returns: SDK 确认下发成功时为 True；法兰或 0 自由度配置直接返回 True。
+        Raises: ValueError trigger 非数值或非有限值。
+        """
         if self._type == "flange" or self._dof == 0:
             return True
         if isinstance(trigger, bool) or not isinstance(trigger, (int, float)):

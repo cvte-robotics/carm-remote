@@ -30,6 +30,13 @@ def main(argv=None) -> int:
     args, qt_args = parser.parse_known_args(argv)
 
     app = QApplication([sys.argv[0], *qt_args])
+    # Fusion 让主窗口样式表在 Windows/Linux 上渲染一致。
+    app.setStyle("Fusion")
+    # 样式表按浅色主题设计；Qt 6.8+ 才能固定配色方案，旧版本保持系统默认。
+    if hasattr(app.styleHints(), "setColorScheme"):
+        from PyQt6.QtCore import Qt
+
+        app.styleHints().setColorScheme(Qt.ColorScheme.Light)
     app.setOrganizationName("CVTE")
     app.setApplicationName("CARMQuestDesktop")
     app.setApplicationDisplayName("CARM 手柄遥操")

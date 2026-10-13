@@ -1,4 +1,4 @@
-"""Quest-specific configuration and pose-jump thresholds."""
+"""Quest 侧配置解析与 pose jump 阈值（纯函数，不读文件）。"""
 
 from __future__ import annotations
 
@@ -12,12 +12,24 @@ DEFAULT_QUEST_ROTATION_THRESHOLD_DEG = 20.0
 
 @dataclass(frozen=True)
 class QuestPoseJumpConfig:
+    """Quest pose jump 检测阈值（位置米、旋转度）。"""
+
     position_threshold_m: float
     rotation_threshold_deg: float
 
 
 def resolve_quest_pose_jump(data: Mapping[str, Any]) -> QuestPoseJumpConfig:
-    """Resolve Quest jump thresholds without loading files or causing side effects."""
+    """解析 Quest jump 阈值，不加载文件、不产生副作用；无小节时用默认值。
+
+    Args:
+        data: 已加载的配置映射。
+
+    Returns:
+        冻结的阈值配置。
+
+    Raises:
+        ValueError: 小节不是映射，或任一阈值越界/非法。
+    """
     if "quest_pose_jump" not in data:
         return QuestPoseJumpConfig(
             position_threshold_m=DEFAULT_QUEST_POSITION_THRESHOLD_M,
@@ -28,6 +40,7 @@ def resolve_quest_pose_jump(data: Mapping[str, Any]) -> QuestPoseJumpConfig:
         raise ValueError("quest_pose_jump 必须是对象")
 
     def require_bounded_number(key: str, maximum: float) -> float:
+        """取一个 (0, maximum] 内的有限数值，否则抛 ValueError。"""
         value = section.get(key)
         if (isinstance(value, bool) or not isinstance(value, (int, float)) or
                 not math.isfinite(value) or value <= 0 or value > maximum):

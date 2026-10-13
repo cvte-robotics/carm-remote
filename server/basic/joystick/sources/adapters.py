@@ -1,17 +1,16 @@
-"""Strict adapters between legacy input objects and neutral samples."""
+"""provider 解析对象 → 中立冻结样本（sample）的严格适配器。"""
 
 import math
 from typing import Any, Tuple, Union
 
 from carm_teleop_input_contracts import ButtonSample, PoseSample, RawInputBatch
 
-from ..core.models import create_button_status, create_pose_data
-
 
 _MISSING = object()
 
 
 def _number(value: Any, field: str) -> Union[int, float]:
+    """校验并返回有限数值（拒绝 bool）。"""
     if (
         isinstance(value, bool)
         or not isinstance(value, (int, float))
@@ -22,18 +21,21 @@ def _number(value: Any, field: str) -> Union[int, float]:
 
 
 def _integer(value: Any, field: str) -> int:
+    """校验并返回非 bool 整数。"""
     if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError(f"{field} must be a non-bool integer")
     return value
 
 
 def _boolean(value: Any, field: str) -> bool:
+    """校验并返回布尔值。"""
     if not isinstance(value, bool):
         raise ValueError(f"{field} must be a boolean")
     return value
 
 
 def _attribute(obj: Any, name: str, default: Any = _MISSING) -> Any:
+    """读取属性；缺失时返回 default，未给 default 则报错。"""
     value = getattr(obj, name, _MISSING)
     if value is _MISSING:
         if default is _MISSING:
@@ -43,6 +45,7 @@ def _attribute(obj: Any, name: str, default: Any = _MISSING) -> Any:
 
 
 def _vector(obj: Any, attribute: str) -> Tuple[float, float, float]:
+    """读取三分量向量：优先 list/tuple 字段，否则回退 _x/_y/_z 分量。"""
     value = getattr(obj, attribute, _MISSING)
     if value is not _MISSING:
         if not isinstance(value, (list, tuple)) or len(value) != 3:
@@ -59,6 +62,7 @@ def _vector(obj: Any, attribute: str) -> Tuple[float, float, float]:
 
 
 def pose_sample_from_object(pose: Any) -> PoseSample:
+    """把 provider 位姿对象适配为冻结的 PoseSample。"""
     return PoseSample(
         x=_number(_attribute(pose, "x"), "x"),
         y=_number(_attribute(pose, "y"), "y"),
@@ -76,6 +80,7 @@ def pose_sample_from_object(pose: Any) -> PoseSample:
 
 
 def button_sample_from_object(button: Any) -> ButtonSample:
+    """把 provider 按钮对象适配为冻结的 ButtonSample。"""
     return ButtonSample(
         trigger=_integer(_attribute(button, "trigger"), "trigger"),
         grip=_integer(_attribute(button, "grip"), "grip"),
@@ -95,42 +100,8 @@ def button_sample_from_object(button: Any) -> ButtonSample:
     )
 
 
-def pose_sample_to_legacy(sample: PoseSample):
-    return create_pose_data(
-        timestamp=sample.timestamp,
-        x=sample.x,
-        y=sample.y,
-        z=sample.z,
-        qx=sample.qx,
-        qy=sample.qy,
-        qz=sample.qz,
-        qw=sample.qw,
-        confidence=sample.confidence,
-        linear_velocity=list(sample.linear_velocity),
-        angular_velocity=list(sample.angular_velocity),
-        acceleration=list(sample.acceleration),
-    )
-
-
-def button_sample_to_legacy(sample: ButtonSample):
-    return create_button_status(
-        timestamp=sample.timestamp,
-        trigger=sample.trigger,
-        grip=sample.grip,
-        btn_xa=sample.btn_xa,
-        btn_yb=sample.btn_yb,
-        btn_menu=sample.btn_menu,
-        btn_system=sample.btn_system,
-        menu_capture=sample.menu_capture,
-        joystick_x=sample.joystick_x,
-        joystick_y=sample.joystick_y,
-        joystick_z=sample.joystick_z,
-        reserve=sample.reserve,
-    )
-
-
 def validate_raw_input_batch(batch: RawInputBatch) -> RawInputBatch:
-    """Force construction-time validation at the host event boundary."""
+    """在 Host 事件边界强制 RawInputBatch 的构造期校验。"""
     if not isinstance(batch, RawInputBatch):
         raise TypeError("input modules must publish RawInputBatch instances")
     return batch
