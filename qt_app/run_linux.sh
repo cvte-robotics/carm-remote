@@ -12,8 +12,8 @@ if [[ "${1:-}" == "--preflight-only" ]]; then
     shift
 fi
 
-if ! "$BOOTSTRAP_PYTHON" -c 'import sys; raise SystemExit(0 if (3, 11) <= sys.version_info[:2] < (3, 13) else 1)'; then
-    echo "Error: Python >=3.11,<3.13 is required" >&2
+if ! "$BOOTSTRAP_PYTHON" -c 'import sys; raise SystemExit(0 if (3, 8) <= sys.version_info[:2] < (3, 13) else 1)'; then
+    echo "Error: Python >=3.8,<3.13 is required" >&2
     exit 1
 fi
 

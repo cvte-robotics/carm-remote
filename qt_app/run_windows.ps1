@@ -38,8 +38,8 @@ function Assert-NativeSuccess {
     }
 }
 
-& $BootstrapPython -c 'import sys; sys.exit(0 if (3, 11) <= sys.version_info[:2] < (3, 13) else 1)'
-Assert-NativeSuccess $LASTEXITCODE 'Python version check (requires >=3.11,<3.13)'
+& $BootstrapPython -c 'import sys; sys.exit(0 if (3, 8) <= sys.version_info[:2] < (3, 13) else 1)'
+Assert-NativeSuccess $LASTEXITCODE 'Python version check (requires >=3.8,<3.13)'
 
 if (-not (Test-Path $VenvPython)) {
     Write-Host "Creating Windows desktop environment at $VenvRoot"
