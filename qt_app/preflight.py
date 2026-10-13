@@ -9,7 +9,7 @@ import socket
 import subprocess
 import sys
 
-MIN_PYTHON = (3, 11)
+MIN_PYTHON = (3, 8)
 MAX_PYTHON = (3, 13)
 CARM_VERSION = "0.1.20260819"
 CARM_REVISION = "3f45eb487170e151d164d3b110a2b8580c48daf4"
