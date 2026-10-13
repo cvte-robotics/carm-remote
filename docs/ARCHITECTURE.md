@@ -62,9 +62,9 @@ flowchart LR
 
 平台脚本依次执行：
 
-1. 检查 Python 版本是否为 3.11 或 3.12。
+1. 检查 Python 版本是否在 3.8 – 3.12 之间。
 2. 创建 `qt_app/.venv-windows` 或 `qt_app/.venv-linux`。
-3. 检查依赖，缺失时从 `qt_app/requirements.txt` 安装。
+3. 检查依赖，缺失时从 `qt_app/requirements.txt` 安装；NumPy 和 SciPy 用环境标记区分 Python 3.8 与 3.9 及以上的固定版本。
 4. 执行 `qt_app/preflight.py`。
 5. 从仓库根目录运行 `qt_app/main.py`。
 
