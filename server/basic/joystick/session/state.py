@@ -64,6 +64,22 @@ Host 持有的公开快照，由 JoystickController 数据锁保护。
         self.data_sequence = 0
         # 输入源声明的设备状态项（item_id -> DeviceStatusItem），插入序即展示序。
         self.device_status = {}
+        # 腰状态，与双臂初始化/停止共用会话生命周期。
+        self.waist = {"status": "unavailable", "following": False, "error": None}
+        self.arm_angle = None
+        self.direct = {
+            "active": False,
+            "stage": "waiting_app",
+            "family": None,
+            "model": None,
+            "config": {
+                "mode": "single", "hand": "right", "other_arm_ip": None,
+                "scale": 0.4, "yaw": -90,
+            },
+            "editable": [],
+            "error_code": None,
+            "message": None,
+        }
         self.arm_states = {
             "master": {
                 "ip": None,

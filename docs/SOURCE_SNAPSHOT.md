@@ -1,11 +1,11 @@
 # 源码文件说明
 
-本文按当前仓库文件树说明各文件职责。这里只记录仓库中实际存在的文件；运行关系与 API 详见 [整体架构](ARCHITECTURE.md)。
+本文按 [整体架构](ARCHITECTURE.md) 中记录的源码同步基线说明公开桌面投影的文件树与职责。
 
 ## 1. 文件树
 
 ```text
-carm_quest_desktop/
+carm-remote/
 ├── .gitattributes
 ├── .gitignore
 ├── LICENSE
@@ -20,6 +20,7 @@ carm_quest_desktop/
 │   └── SOURCE_SNAPSHOT.md
 ├── include/
 │   ├── carm_teleop_input_contracts.py
+│   ├── carm_teleop_intent.py
 │   └── quest/
 │       ├── __init__.py
 │       ├── adb.py
@@ -71,28 +72,34 @@ carm_quest_desktop/
             ├── core/
             │   ├── __init__.py
             │   ├── command_controller.py
+            │   ├── joint_motion.py
             │   ├── mailbox.py
             │   ├── models.py
+            │   ├── pose_mapping.py
             │   └── pose_math.py
             ├── runtime/
             │   ├── __init__.py
+            │   ├── carm_link.py
             │   ├── config.py
-            │   ├── context.py
             │   ├── dependencies.py
+            │   ├── direct_config.py
             │   └── paths.py
             ├── session/
             │   ├── __init__.py
             │   ├── arm.py
+            │   ├── arm_angle.py
             │   ├── cleanup.py
             │   ├── control_stats.py
             │   ├── control_transaction.py
             │   ├── controller.py
+            │   ├── direct.py
             │   ├── end_effector_sender.py
+            │   ├── maintenance.py
             │   ├── observation.py
-            │   └── state.py
+            │   ├── state.py
+            │   └── waist.py
             └── sources/
                 ├── __init__.py
-                ├── adapters.py
                 └── registry.py
 ```
 
@@ -111,7 +118,7 @@ carm_quest_desktop/
 
 | 文件 | 职责 |
 |---|---|
-| `config/joystick_config.json` | 保存 Quest 位姿跳变阈值以及单臂/双臂初始化关节配置 |
+| `config/joystick_config.json` | 保存 Quest 位姿跳变阈值、各臂初始化/停止/遥操回位关节目标、D3 腰与臂型角参数 |
 | `docs/ARCHITECTURE.md` | 记录整体架构、数据流、生命周期、控制链和 API |
 | `docs/END_EFFECTOR_DEVELOPMENT.md` | 记录新增末端实现的扩展合同、加载方式、调用语义和验证方法 |
 | `docs/SOURCE_SNAPSHOT.md` | 记录当前文件树和逐文件职责 |
@@ -140,7 +147,7 @@ carm_quest_desktop/
 | 文件 | 主要对象 | 职责 |
 |---|---|---|
 | `__init__.py` | 包标记 | 将目录声明为 Python package |
-| `main_window.py` | `MainWindow`、`format_device_status` | 创建主窗口、控件、样式表和信号绑定；根据 `UiState` 控制按钮和配置项，并在状态行渲染设备状态项 |
+| `main_window.py` | `MainWindow`、`format_device_status`、`WAIST_STATUS_TEXT` | 创建主窗口、控件、样式表和信号绑定；根据 `UiState` 控制按钮和配置项，渲染设备电量与 D3 腰状态 |
 | `view_model.py` | `ViewModel` | 编排后端启动、扫描、会话配置、Quest 连接、机械臂初始化、停止和窗口关闭 |
 | `models.py` | `UiState`、`ShutdownState`、`Device`、`ArmProbe`、`Snapshot` | 定义 Qt 层状态和展示数据 |
 | `backend_process.py` | `BackendProcess` | 使用 `QProcess` 启动 `server.desktop.app`，传递实例 token 和日志目录，收集标准输出与错误 |
@@ -175,7 +182,7 @@ MainWindow
 
 | 文件 | 职责 |
 |---|---|
-| `joystick_routes.py` | 注册扫描、连接、会话配置、初始化、yaw 与兼容四档标定、灵敏度、数据显示侧、停止、状态和 SSE 路由；统一生成 `code/msg` 响应，并为用户操作接入排他准入 |
+| `joystick_routes.py` | 注册扫描、连接、会话配置、初始化、yaw 与兼容四档标定、灵敏度、关节速度档位、数据显示侧、停止、状态和 SSE 路由；统一生成 `code/msg` 响应，并接入排他准入；Desktop 关闭维护路由 |
 
 桌面管理路由位于 `server/desktop/app.py`，joystick 路由位于 `server/api/joystick_routes.py`。两者共同构成 Qt 使用的本机 API。
 
@@ -204,10 +211,12 @@ MainWindow
 | 文件 | 主要对象 | 职责 |
 |---|---|---|
 | `__init__.py` | 包标记 | 控制核心 package |
-| `mailbox.py` | `LatestValueCell`、`PublicationSignal`、`HandInputFrame`、`InputPublication` | 每手单槽最新值信箱、冻结输入帧和输入发布唤醒信号 |
-| `models.py` | `pose_to_dict`、`button_to_dict` | 把输入对象转换为 JSON 字典 |
-| `pose_math.py` | `build_calibration_matrix`、`legacy_mode_to_yaw`、`project_input_to_arm`、`apply_pose_delta` | 构建 yaw 标定矩阵、换算兼容四档标定，完成坐标投影、四元数处理、缩放和相对位姿计算 |
-| `command_controller.py` | `CommandController` | 管理一个机械臂连接、反馈同步、初始化运动、目标计算和 home/stop 所需的机械臂操作 |
+| `mailbox.py` | `LatestValueCell`、`PublicationSignal`、`HandInputFrame`、`InputPublication` | 保存双手同批的最新 publication、头盔/机身输入、冻结输入帧及发布唤醒信号 |
+| `models.py` | `pose_to_dict`、`button_to_dict`、`intent_to_dict`、`head_pose_to_dict`、`body_intent_to_dict` | 把冻结输入与功能结果转换为 HTTP/SSE JSON 字典 |
+| `pose_math.py` | `build_calibration_matrix`、`legacy_mode_to_yaw`、`input_pose_to_arm`、`apply_pose_delta` | 用标准库构建 yaw 标定矩阵、完成坐标投影、连续四元数处理、缩放和相对位姿计算 |
+| `pose_mapping.py` | `PoseMapping`、`select_output_baseline` | 手臂与头盔腰共用的输入/输出基线、目标计算和重建基线选择；由各自控制线程独占 |
+| `joint_motion.py` | `JointMotionWatch` | 根据任务结束标识、新鲜位置与静止反馈判定遥操中关节回位是否到位 |
+| `command_controller.py` | `CommandController`、`ControlParams`、`ControlSample`、`JointMoveAttempt` | 单臂映射、反馈、关节回位与 SDK 派发；映射和回位状态由所属控制线程独占 |
 
 `CommandController` 负责计算控制目标并封装单臂操作；会话层的 `ControlTransaction` 负责实时采样、策略门禁、物理派发和派发后的身份确认。
 
@@ -216,9 +225,10 @@ MainWindow
 | 文件 | 主要对象 | 职责 |
 |---|---|---|
 | `__init__.py` | 包标记 | joystick runtime package |
-| `config.py` | `JoystickConfigSnapshot`、`ArmControlConfig`、`identify_arm_model` | 加载并校验 `joystick_config.json`；按名称和自由度识别 `A3_C`/`A3_T`/`A3_S`/`D3`，并按 `型号 -> 模式 -> 臂侧` 解析初始化关节 |
-| `context.py` | `JOYSTICK_CONFIG` | 在模块导入时创建当前后端进程使用的配置快照 |
-| `dependencies.py` | `Carm` adapter、依赖可用性标记 | 导入 NumPy、SciPy 和 Carm，并为 Carm 连接增加连接身份绑定的位姿派发 |
+| `config.py` | `JOYSTICK_CONFIG`、`JoystickConfigSnapshot`、`ArmControlConfig`、`WaistControlConfig`、`ArmAngleControlConfig`、`identify_arm_model` | 加载配置快照，识别型号，解析各臂三类关节目标、腰、臂型角与共享连接开关 |
+| `dependencies.py` | `Carm`、`PendingReply`、`sdk_nowait`、`ARM_SDK_AVAILABLE` | 封装连接身份门禁、只发不等请求、登记回复与关节速度兼容；不再导入 NumPy/SciPy |
+| `carm_link.py` | `CarmLink`、`CarmLinkRegistry`、`CarmChannel` | 同一控制端点共用 WebSocket、读线程与状态帧，各 `arm_index` 通过通道视图独立路由 |
+| `direct_config.py` | `load_config`、`save_config` | 板端 Quest 直连配置校验与原子保存；Desktop 不启动对应管理器 |
 | `paths.py` | 输入模块路径函数 | 选择输入模块根目录、设置 import path，并校验桌面运行使用的 Quest 模块来源 |
 
 ### 6.5 `session/`
@@ -227,13 +237,17 @@ MainWindow
 |---|---|---|
 | `__init__.py` | 包标记 | joystick session package |
 | `state.py` | `SessionPhase`、`JoystickState` | 定义会话相位，保存设备、输入、双手、机械臂、transport、标定/灵敏度、设备状态项和 SSE sequence 等共享状态 |
-| `arm.py` | `build_arm_bindings`、`ArmRuntime`、`BaseArmSession` | 创建 arm binding（同板双臂固定 index 0 为左、index 1 为右），初始化一个或两个 `CommandController`，启动控制线程并执行 stop/home |
-| `control_transaction.py` | `ControlTransaction`、`LoopTermination`、`ControlStepOutcome` | 为一个 ArmRuntime 运行完整的实时控制事务：按输入节拍唤醒或 72 Hz 固定节拍，执行采样、策略门禁、派发和终止回报 |
+| `arm.py` | `build_arm_bindings`、`ArmRuntime`、`BaseArmSession` | 创建 arm binding（同板双臂 index 0 左、index 1 右），装配末端、腰与臂型角运行时，管理各臂控制线程和 stop/home |
+| `arm_angle.py` | `ArmAngleRuntime`、`ArmAngleInput`、`create_arm_angle_runtimes` | 按 SDK/APK/配置条件启用 D3 臂型角；由本臂控制线程以 20 Hz 步进，登记查询回复后跨周期读取 |
+| `waist.py` | `WaistRuntime`、`FreshRobotState`、`create_waist_runtime` | 检测两轴腰，以独立控制线程处理头盔/摇杆方式、反馈新鲜度、跟随重触发和回位/停止 |
+| `control_transaction.py` | `ControlTransaction`、`LoopTermination`、`ControlStepOutcome` | 按输入节拍或 72 Hz 固定节拍运行单臂采样、门禁、派发和终止回报；同周期调用本臂臂型角 tick |
 | `control_stats.py` | `ControlLoopStats`、`percentile` | 按 5 秒窗口统计控制周期、步时、派发与输入频率、跳帧和发布到派发延迟；当前周期日志输出已注释 |
-| `end_effector_sender.py` | `AsyncEndEffectorSender` | 每臂一个最新值末端发送线程：值变化、0.5 秒保活或失败后重发时调用真实 Driver，并输出 `[EndEffectorStats]` |
+| `end_effector_sender.py` | `EndEffectorSender` | 在本臂控制线程内按值变化、0.5 秒保活或失败重试条件调用只发不等驱动；没有独立 worker 或队列 |
 | `cleanup.py` | `SessionCleanup`、`CleanupContext`、`CleanupResult` | 按固定上下文停止机械臂和输入源，失败时保留原 owner 供同一清理事务重试 |
 | `observation.py` | `ObservationSnapshot`、HTTP/SSE 投影函数 | 生成不可变 Host 状态快照，并分别投影为 HTTP 状态和 SSE 载荷 |
 | `controller.py` | `JoystickController` | 遥操会话主控制器；拥有 source registry、共享状态、机械臂 session、生命周期门禁和清理编排 |
+| `maintenance.py` | `ArmMaintenance` | 封装初始化位置确认、缓存和当前关节读取；对应 HTTP 维护路由在 Desktop 组合中不注册 |
+| `direct.py` | `QuestDirectManager` | 板端自动维持 Quest 待命链路并处理头显会话请求；包含在投影中但 Desktop 不创建或启动它 |
 
 `JoystickController` 的主要责任链：
 
@@ -253,20 +267,20 @@ scan_devices
 |---|---|---|
 | `__init__.py` | 包标记 | joystick source package |
 | `registry.py` | `SourceRegistry`、`SourceLeaseAllocator`、`ActiveSourceBinding`、`BindingPhase` | 注册输入模块、生成扫描 descriptor 和 lease、维护 provisional/active/closed binding |
-| `adapters.py` | sample/legacy 转换函数 | 严格校验输入对象，把中立 `PoseSample` / `ButtonSample` 转换为控制层使用的兼容对象 |
 
 ## 7. 中立输入合同
 
 | 文件 | 主要对象 | 职责 |
 |---|---|---|
-| `include/carm_teleop_input_contracts.py` | `SourceCapabilities`、`ArmProfile`、`DeviceCandidate`、`SourceLease`、`RawInputBatch`、`DeviceStatusItem`、`BaseInputSourceModule`、`BaseSourceControlPolicy` | 定义输入模块与 host 之间不可变的数据合同、能力位、身份字段和 provider 接口 |
+| `include/carm_teleop_input_contracts.py` | `SourceCapabilities`、`ArmProfile`、`DeviceCandidate`、`SourceLease`、`RawInputBatch`、`HandIntentSample`、`BodyIntentSample`、`DeviceStatusItem`、`BaseInputSourceModule` | 定义输入模块与 Host 之间的冻结数据、功能结果、能力位、身份与 provider 接口 |
+| `include/carm_teleop_intent.py` | `LegacyHandIntentAdapter` | 每手持有的旧按键到功能结果适配；累计回位事件序号，供未协商 intent 的旧 APK 使用 |
 
 关键合同分为五组：
 
 - 设备发现与能力：`SourceAvailability`、`DeviceCandidate`、`SourceCapabilities`、`ArmProfile`
 - 连接身份：`SourceLease`、`ConnectOutcome`、`ConnectResult`
 - 输入数据：`PoseSample`、`ButtonSample`、`JointTargetSample`、`HandInputUpdate`、`RawInputBatch`
-- 控制策略：`ControlContext`、`ControlDecision`、`SourceControlPolicy`、`BaseSourceControlPolicy`
+- 功能与检测结果：`HandIntentSample`、`BodyIntentSample`、`WaistControlSample`（含头盔 `PoseSample`）、`InputUpdateDecision`
 - Host 接口与遥测：`SourceEventSink`、`InputSourceModule`、`BaseInputSourceModule`、`DeviceStatusItem`
 
 ## 8. Quest 输入模块
@@ -275,13 +289,13 @@ scan_devices
 |---|---|---|
 | `include/quest/__init__.py` | `QuestInputModule` 导出 | 声明 Quest module ID、API 版本并导出模块实现 |
 | `include/quest/factory.py` | `create_provider` | 在 registry 首次需要时延迟构造 Quest provider |
-| `include/quest/constants.py` | Quest 协议与超时常量 | 定义 TCP 地址、端口、包名、协议版本、heartbeat、handshake、接收超时、记录上限和电量轮询间隔 |
+| `include/quest/constants.py` | Quest 协议、能力与功能字段表 | 定义 TCP、超时、协议、包名与 `QUEST_INTENT_FIELDS`；核心手臂字段和可选腰/臂型角字段共用校验表 |
 | `include/quest/adb.py` | ADB 辅助函数 | 执行 adb、解析设备列表、识别 Quest、读取设备信息、重启 ADB 服务和启动 Quest 包 |
 | `include/quest/device_status.py` | `QuestDeviceStatusPoller`、`read_quest_device_status` | 每 15 秒经 ADB `dumpsys` 读取头盔与左右手柄电量，发布为设备状态项 |
 | `include/quest/receiver.py` | `QuestTcpReceiver` | 监听 `127.0.0.1:9999`，处理 protocol 2 协商、输入帧、heartbeat、超时和连接 generation |
-| `include/quest/parser.py` | `parse_quest_frame` | 把一条 Quest payload 转换为左右手位姿、按钮和 frame index 数据 |
+| `include/quest/parser.py` | `parse_quest_frame`、`parse_waist_control` | 把已校验的输入转换为左右手位姿、原始按钮、功能结果、头盔/机身输入与帧序号 |
 | `include/quest/config.py` | `QuestPoseJumpConfig` | 解析并校验位置与旋转跳变阈值 |
-| `include/quest/policy.py` | `QuestInputPolicy`、decision/token 数据类 | 继承 `BaseSourceControlPolicy`；判断输入是否可接受、处理跳变与 rebase、维护帧屏障，并为控制派发生成可验证 token |
+| `include/quest/policy.py` | `QuestInputPolicy` | 输入线程独占相邻帧比较状态，输出跳变、旋转锁边沿与传输换代的断续事件，不读写控制器映射、不生成派发 token |
 | `include/quest/module.py` | `QuestInputModule` | 继承 `BaseInputSourceModule`，声明能力位与 `arm_profile`；拥有 ADB reverse、receiver、serial、lease、重连 timer、电量轮询和 Quest 资源清理 |
 
 Quest 文件之间的调用关系：

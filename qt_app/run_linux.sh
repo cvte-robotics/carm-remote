@@ -22,7 +22,7 @@ if [[ ! -x "$VENV_ROOT/bin/python" ]]; then
     "$BOOTSTRAP_PYTHON" -m venv "$VENV_ROOT"
 fi
 
-if ! "$VENV_ROOT/bin/python" -c 'import importlib.metadata as m; import PyQt6, flask, werkzeug, numpy, scipy, websocket, zeroconf, carm; raise SystemExit(0 if m.version("carm") >= "0.1.20260819" else 1)' >/dev/null 2>&1; then
+if ! "$VENV_ROOT/bin/python" -c 'import importlib.metadata as m; import PyQt6, flask, werkzeug, websocket, zeroconf, carm; raise SystemExit(0 if m.version("carm") >= "0.1.20260819" else 1)' >/dev/null 2>&1; then
     echo "Installing desktop runtime dependencies"
     PIP_DISABLE_PIP_VERSION_CHECK=1 "$VENV_ROOT/bin/python" -m pip install -r "$QT_ROOT/requirements.txt"
 fi

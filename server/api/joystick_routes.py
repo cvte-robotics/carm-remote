@@ -11,6 +11,7 @@ import uuid
 from typing import Callable, Dict, Optional, Tuple
 
 from flask import Response, request, stream_with_context
+from basic.joystick.core.command_controller import MOVE_SPEED_LEVELS
 from basic.joystick.session.observation import project_sse_payload
 
 
@@ -52,8 +53,6 @@ def register_joystick_routes(
     operation_runner: Optional[OperationRunner] = None,
     include_maintenance_routes: bool = True,
     allow_get_disconnect: bool = True,
-    *,
-    dependencies_available=True,
 ) -> None:
     """注册一套 profile 感知的 joystick HTTP/SSE 路由。
 
@@ -64,19 +63,10 @@ def register_joystick_routes(
         operation_runner: 桌面端用户操作准入包装。
         include_maintenance_routes: 是否注册维护类路由。
         allow_get_disconnect: 是否允许用 GET 停止会话。
-        dependencies_available: 依赖可用性（布尔或可调用）。
     """
 
     custom_scan_handler = scan_handler is not None
     scan_handler = scan_handler or _default_scan
-
-    def dependencies_ready() -> bool:
-        """解析 dependencies_available 的布尔/可调用两种形态。"""
-        return bool(
-            dependencies_available()
-            if callable(dependencies_available)
-            else dependencies_available
-        )
 
     def current_controller():
         """解析 controller 的实例/getter 两种形态。"""
@@ -98,14 +88,12 @@ def register_joystick_routes(
         return operation_runner(body, admitted_operation, cancel=cancel)
 
     def require_available(handler):
-        """包装 handler：统一处理 OPTIONS 预检与依赖/功能不可用。"""
+        """包装 handler：统一处理 OPTIONS 预检与功能不可用。"""
         @wraps(handler)
         def wrapped(*args, **kwargs):
             """执行预检与可用性检查后进入原 handler。"""
             if request.method == "OPTIONS":
                 return _json_response()
-            if not dependencies_ready():
-                return _failed("手柄遥操依赖模块不可用")
             joystick_controller = current_controller()
             if not getattr(joystick_controller, "available", False):
                 return _failed("手柄遥操功能不可用")
@@ -224,6 +212,8 @@ def register_joystick_routes(
     def joystick_init_arm(joystick_controller):
         """POST/OPTIONS /api/joystick/init_arm：初始化单/双臂与手侧绑定。"""
         try:
+            if joystick_controller.state.direct["active"]:
+                return _failed("Quest 直连会话正在运行，请先结束遥操")
             body = request.get_json(silent=True) or {}
             mode = body.get("mode", "single")
             master_ip = body.get("master_ip") or body.get("ip", "10.42.0.101")
@@ -309,6 +299,15 @@ def register_joystick_routes(
         "设置灵敏度失败",
     )
     register_value_route(
+        # POST/OPTIONS /api/joystick/move_speed：设置遥操 move_joint 速度档位 low/medium/high。
+        "/api/joystick/move_speed",
+        "joystick_move_speed",
+        lambda value: isinstance(value, str) and value in MOVE_SPEED_LEVELS,
+        lambda joystick_controller, value: joystick_controller.set_move_speed_level(value),
+        "速度档位必须为 low、medium 或 high",
+        "设置速度档位失败",
+    )
+    register_value_route(
         # POST/OPTIONS /api/joystick/view_side：设置查看侧 left/right。
         "/api/joystick/view_side",
         "joystick_view_side",
@@ -318,11 +317,23 @@ def register_joystick_routes(
         "设置查看侧失败",
     )
 
+    @app.route("/api/joystick/move_speed", methods=get_methods, endpoint="joystick_get_move_speed")
+    @require_available
+    def joystick_get_move_speed(joystick_controller):
+        """GET/OPTIONS /api/joystick/move_speed：读取当前速度档位及对应 SDK speed。"""
+        try:
+            return _json_response(body={"data": joystick_controller.get_move_speed_level()})
+        except Exception:
+            logging.exception("[JoystickAPI] Get move speed failed")
+            return _failed("获取速度档位失败")
+
     @app.route("/api/joystick/session_config", methods=post_methods)
     @require_available
     def joystick_session_config(joystick_controller):
         """POST/OPTIONS /api/joystick/session_config：更新 mode/master_side/view_side/slave_ip。"""
         try:
+            if joystick_controller.state.direct["active"]:
+                return _failed("Quest 直连会话正在运行，请先结束遥操")
             body = request.get_json(silent=True) or {}
             accepted, success = run_operation(
                 body,
@@ -344,10 +355,6 @@ def register_joystick_routes(
     def joystick_status():
         """GET /api/joystick/status：返回可用性与会话状态（不可用也返回 200）。"""
         try:
-            if not dependencies_ready():
-                return _json_response(
-                    body={"data": {"available": False, "status": "dependencies_not_available"}}
-                )
             joystick_controller = current_controller()
             if not getattr(joystick_controller, "available", False):
                 return _json_response(
@@ -362,13 +369,24 @@ def register_joystick_routes(
         @app.route("/api/joystick/confirm_init_position", methods=post_methods)
         @require_available
         def joystick_confirm_init_position(joystick_controller):
-            """POST/OPTIONS /api/joystick/confirm_init_position：确认并记录零点位置。"""
+            """POST/OPTIONS /api/joystick/confirm_init_position：确认并记录初始化位置。
+
+            可选 mode/slave_ip/master_side/side 选择单臂、异板双臂或同板双臂。
+            可选 init_joint 指定初始化位置，缺省使用当前位置。
+            """
             try:
                 body = request.get_json(silent=True) or {}
-                ip = body.get("ip", "10.42.0.101")
-                if joystick_controller.confirm_init_position(ip):
-                    return _json_response("确认初始化位置成功")
-                return _failed("确认初始化位置失败")
+                result = joystick_controller.confirm_init_position(
+                    body.get("ip", "10.42.0.101"),
+                    mode=body.get("mode"),
+                    slave_ip=body.get("slave_ip"),
+                    master_side=body.get("master_side"),
+                    side=body.get("side"),
+                    init_joint=body.get("init_joint"),
+                )
+                if result.get("error"):
+                    return _failed(result["error"])
+                return _json_response("确认初始化位置成功", body={"data": result})
             except Exception:
                 logging.exception("[JoystickAPI] Confirm init position failed")
                 return _failed("确认初始化位置失败")
@@ -376,7 +394,7 @@ def register_joystick_routes(
         @app.route("/api/joystick/get_init_position", methods=get_methods)
         @require_available
         def joystick_get_init_position(joystick_controller):
-            """GET/OPTIONS /api/joystick/get_init_position：读取已记录的零点。"""
+            """GET/OPTIONS /api/joystick/get_init_position：读取当前生效值与已确认覆盖值。"""
             try:
                 position = joystick_controller.get_init_position()
                 if position.get("error"):
@@ -389,15 +407,23 @@ def register_joystick_routes(
         @app.route("/api/joystick/get_current_joints", methods=get_methods)
         @require_available
         def joystick_get_current_joints(joystick_controller):
-            """GET/OPTIONS /api/joystick/get_current_joints：读取指定 IP 的当前关节值。"""
+            """GET/OPTIONS /api/joystick/get_current_joints：按单/双臂拓扑读取当前关节值。"""
             try:
-                ip = request.args.get("ip", "10.42.0.101")
-                joints = joystick_controller.get_current_joints(ip)
+                joints = joystick_controller.get_current_joints(
+                    request.args.get("ip", "10.42.0.101"),
+                    mode=request.args.get("mode"),
+                    slave_ip=request.args.get("slave_ip"),
+                    master_side=request.args.get("master_side"),
+                    side=request.args.get("side"),
+                )
                 if joints.get("error"):
                     return _failed(joints.get("error", "获取当前关节值失败"))
-                if joints.get("current_joints") is not None:
+                if joints.get("arms"):
                     return _json_response(
-                        body={"data": {"joints": joints.get("current_joints")}}
+                        body={"data": {
+                            "joints": joints.get("current_joints"),
+                            "arms": joints.get("arms"),
+                        }}
                     )
                 return _failed("获取当前关节值失败：未知错误")
             except Exception as exc:

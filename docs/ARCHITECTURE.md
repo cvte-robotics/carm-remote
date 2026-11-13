@@ -2,6 +2,8 @@
 
 本文面向维护者，描述当前仓库中可以从源码确认的运行结构、模块边界、数据流、状态管理、Quest 输入链、机械臂控制链和 HTTP/SSE API。
 
+文档同步基线：后端 `master.dev` 的 `1d1c103`（2026-11-10）经公开白名单导出的桌面源码，并包含本次桌面依赖声明与启动探测清理。根目录 README、源码索引与末端扩展说明使用同一基线。桌面入口只启用 Quest provider；虽然导出目录包含 `QuestDirectManager` 与配置模块，Desktop 不创建或启动板端直连管理器，连接与初始化仍由 Qt 工作流发起。
+
 ## 1. 系统组成
 
 应用运行时包含两个本机进程：
@@ -40,8 +42,11 @@ flowchart LR
 | API 适配 | `server/api/joystick_routes.py` | 把 HTTP/SSE 请求映射到 controller |
 | 会话主体 | `server/basic/joystick/session/controller.py` | 输入会话、共享状态、SSE 快照、机械臂会话和停止编排 |
 | 实时事务 | `server/basic/joystick/session/control_transaction.py` | 单个 ArmRuntime 的输入采样、策略门禁、物理派发和终止回报 |
-| 输入信箱 | `server/basic/joystick/core/mailbox.py` | 每手单槽最新值信箱、冻结输入帧和输入发布唤醒信号 |
-| 末端发送 | `server/basic/joystick/session/end_effector_sender.py` | 每臂一个最新值发送线程，把末端 SDK 阻塞调用移出控制环 |
+| 输入信箱 | `server/basic/joystick/core/mailbox.py` | 双手同批的单槽 publication、冻结输入帧和输入发布唤醒信号 |
+| 末端发送 | `server/basic/joystick/session/end_effector_sender.py` | 每臂一个 `EndEffectorSender`，在本臂控制线程内去重、保活并调用只发不等驱动 |
+| 腰与臂型角 | `session/waist.py`、`session/arm_angle.py` | 腰独立控制线程；臂型角由本臂控制线程步进 |
+| 共用映射 | `server/basic/joystick/core/pose_mapping.py` | 手臂与头盔腰共用的增量位姿基线与连续四元数分支 |
+| SDK 连接 | `server/basic/joystick/runtime/carm_link.py` | 同一控制端点共用一条 WebSocket，各 arm_index 使用独立通道视图 |
 | 运行统计 | `server/basic/joystick/session/control_stats.py` | 按 5 秒窗口汇总控制周期、步时、派发和输入频率 |
 | 清理事务 | `server/basic/joystick/session/cleanup.py` | 冻结清理身份、编排 arm/provider 清理并保留失败 owner 供重试 |
 | 状态投影 | `server/basic/joystick/session/observation.py` | 生成不可变 Host 快照，并分别投影 HTTP 和 SSE 兼容载荷 |
@@ -64,11 +69,13 @@ flowchart LR
 
 1. 检查 Python 版本是否在 3.8 – 3.12 之间。
 2. 创建 `qt_app/.venv-windows` 或 `qt_app/.venv-linux`。
-3. 检查依赖，缺失时从 `qt_app/requirements.txt` 安装；NumPy 和 SciPy 用环境标记区分 Python 3.8 与 3.9 及以上的固定版本。
+3. 检查依赖，缺失时从 `qt_app/requirements.txt` 安装。
 4. 执行 `qt_app/preflight.py`。
 5. 从仓库根目录运行 `qt_app/main.py`。
 
 `preflight.py` 检查 Python 依赖、Carm 包版本、ADB 命令、端口 `1999` 和 `9999`、运行所需文件以及 Quest 模块导入。
+
+位姿计算只使用标准库。`requirements.txt`、`pyproject.toml`、Windows/Linux 启动脚本的依赖探测与 preflight 已统一移除 NumPy/SciPy；启动时不会因缺少这两个包而重复进入安装分支。
 
 `qt_app/main.py` 加载包内可用的末端实现，创建 `QApplication`、配置日志、再次执行启动检查，然后创建 `MainWindow`。`ViewModel.start()` 通过 `BackendProcess` 启动：
 
@@ -132,7 +139,7 @@ sequenceDiagram
 
 每个 ArmRuntime 在 Carm 连接准备完成后创建自己的末端 Driver。输入源、单/双臂和同/异板拓扑不决定末端实现：`carm` 等价封装原生 flange/gripper/hand，`passthrough` 将一个归一化 trigger 映射为六指相同目标，并依次发送六个 `mode=0` CAN-FD 帧。
 
-Driver 由每臂一个 `AsyncEndEffectorSender` 包装：控制环在严格位姿派发成功后只提交最新 trigger，不等待 SDK 应答；独立线程在值变化、距上次发送超过 0.5 秒（保活）或上次发送失败时调用真实 Driver。停止或控制环异常时丢弃待发值，回零和断开前等待在途发送结束。Driver 本身不创建队列、去重或重试状态，也不把发送尝试解释为物理执行成功。
+Driver 由每臂一个 `EndEffectorSender` 包装：位姿派发成功并通过连接身份复核后，在同一个控制线程内按值变化、0.5 秒保活或失败重试条件调用驱动。原生末端使用 `sdk_nowait()`，透传使用 `send_only()`；没有独立末端线程或待发队列。自定义驱动也必须只发不等，避免拖慢位姿和臂型角控制；返回成功只表示驱动定义的提交结果，不表示实体已经完成动作。
 
 ## 5. 数据流
 
@@ -172,7 +179,7 @@ Quest TCP 帧
   -> RawInputBatch（同一帧内的左右手数据）
   -> JoystickController
   -> QuestInputPolicy
-  -> 每手单槽信箱（LatestValueCell）+ 发布信号（PublicationSignal）
+  -> 双手同批的 InputPublication 单槽 + 发布信号（PublicationSignal）
   -> 对应 ArmRuntime 的 ControlTransaction
   -> CommandController 目标计算
 ```
@@ -181,9 +188,9 @@ Quest TCP 帧
 
 `QuestInputModule` 将一帧输入转换成不可变的 `RawInputBatch`。批次带有 source lease、transport generation 和 batch sequence，用来阻止旧连接的数据进入当前会话。
 
-`QuestInputPolicy` 检查双手帧的一致性、位姿有效性和配置的位姿跳变阈值，并为控制派发产生与当前输入状态绑定的 token。
+接收边界校验输入帧，`QuestInputPolicy` 比较相邻输入、旋转锁边沿和传输世代，输出接收决策与断续事件。它不再生成派发 token，也不读写控制器的映射基线；断续计数交给控制线程消费。
 
-通过策略检查的帧在同一个策略锁临界区内写入每手单槽信箱：双手同批落地，新帧直接覆盖旧帧，控制环只读取最新帧。写入后 `PublicationSignal` 唤醒等待新输入的控制环；信号只做唤醒，不携带数据。
+通过检查的左右手数据与机身输入封装成同一个冻结 `InputPublication`，一次写入最新值单槽；新批次覆盖旧批次，控制环每步只读一次 publication。写入后 `PublicationSignal` 唤醒等待新输入的控制环；信号只做唤醒，不携带数据。每手再接入状态仍分别保存。
 
 ### 5.3 机械臂控制流
 
@@ -200,22 +207,28 @@ ControlTransaction 输入快照与策略门禁
 
 每个机械臂对应一个 `CommandController`、一个 `ControlTransaction` 和一个控制线程。`ControlTransaction` 拥有完整实时循环；`CommandController` 负责目标计算和单臂操作，不拥有循环线程。
 
+`CommandController` 的位姿映射与回位状态只由所属控制线程推进。手臂与头盔腰共用 `PoseMapping`：目标由输出基线叠加输入增量；手臂仅对位置应用灵敏度，姿态按 1:1 映射，头盔腰的位置和姿态均应用灵敏度。重建基线时结合当前是否仍在跟踪、最近目标和新鲜反馈，避免重接入时跳回旧目标。
+
+同一控制端点默认由 `CarmLinkRegistry` 共用一条 WebSocket 和一个接收线程，各机械臂及腰通过 `CarmChannel` 按 `arm_index` 路由。设置 `sdk.shared_connection=false` 可改用独立 SDK 连接。控制周期内运动类命令只发不等；臂型角查询登记回复槽后由后续周期取结果，初始化和清理仍保留必要的同步确认。
+
 控制循环的节拍由输入源能力位 `input_clocked_control` 决定，周期常量为 `control_transaction.py` 中的 `_CONTROL_LOOP_HZ = 72.0`：
 
-- Quest 声明了该能力位：每次输入发布后立即唤醒控制环；步内已有新帧时直接进入下一步，没有新帧时最长等待 1/72 秒兜底，用于反馈刷新、Grip 释放和停止检查。Quest 策略的帧屏障保证每帧最多派发一次。
+- Quest 声明了该能力位：每次输入发布后立即唤醒控制环；步内已有新帧时直接进入下一步，没有新帧时最长等待 1/72 秒兜底，用于反馈刷新、运动开关释放和停止检查。输入策略与控制事务的帧屏障保证每帧最多派发一次。
 - 未声明的输入源按 72 Hz 绝对时间节拍运行，避免“执行后再 sleep”造成的周期漂移；落后时不追赶。
 
 `ControlLoopStats` 在控制线程内按 5 秒窗口统计控制周期、步时、派发与输入频率、跳帧数和“帧发布到物理派发”延迟，不参与控制判断；当前源码中它的周期日志输出已被注释，不会写入日志。末端发送器的 `[EndEffectorStats]` 统计仍按 5 秒窗口写入后端日志。
 
-控制代码中的主要手柄语义：
+控制代码消费 `HandIntentSample`，原始按钮保留作兼容观测。新版 APK 的绑定与按住/切换方式由头显决定：
 
 | 输入 | 当前行为 |
 |---|---|
-| Grip 大于 100 | 允许生成位姿目标；首次按下时同步机械臂反馈基准 |
-| 松开 Grip | 清除待发目标并等待下次重新同步 |
-| Trigger | 交给启动时选择的末端实现解释；`carm` 按 SDK 上下限插值，`passthrough` 映射为六个 `0..1000` 目标 |
-| A/X 且未按 Grip | 发送配置中的初始化关节位置 |
-| B/Y | 切换旋转锁定状态并重建映射基准 |
+| `motion_engaged=true` | 允许生成位姿目标；重新进入跟随时建立映射基线 |
+| `motion_engaged=false` | 清除待发目标，下一次开启时重新同步 |
+| `end_effector` | 交给启动时选择的末端实现；原生按 SDK 上下限插值，透传映射为六个 `0..1000` 目标 |
+| 新的 `home_sequence` 事件且运动关闭 | 下发 `teleop_reset_joint`，由任务结束及位置反馈判定到位；不在忙碌期间排队补发 |
+| `rotation_locked` 变化 | 更新旋转锁并重建映射基线 |
+
+未协商 `intent_v1` 的旧 APK 由每手 `LegacyHandIntentAdapter` 转换：Grip 大于 100 为运动开启，B/Y 为旋转锁状态，Trigger 截断到 `0..127`，A/X 上升沿累计为回初始位事件。同 lease 的传输重连只重建事件基线，不把旧事件当作新动作。
 
 末端实现由启动参数选择，并在机械臂准备阶段创建：
 
@@ -225,7 +238,15 @@ ControlTransaction 输入快照与策略门禁
 
 末端实现不再由核心控制代码写死。新增实现放入 `server/basic/joystick/end_effectors/`，定义唯一的 `NAME` 和 `set_eff`，由启动时的包扫描发现。完整扩展合同与验证方法见 [新增末端控制方式](END_EFFECTOR_DEVELOPMENT.md)。
 
-### 5.4 状态展示流
+### 5.4 腰与臂型角
+
+腰控制仅在同板 D3 双臂、配置启用、APK 已协商 `waist_control_v1` 与 `intent_v1` 且声明 `wf`/`wh`/`ws`、新鲜硬件反馈确认存在两轴腰时启用。明确无腰或旧 APK 仅禁用腰；反馈缺失、异常或超时不能当作无腰，初始化会报错。
+
+`WaistRuntime` 使用 `arm_index=2`，有独立的按输入帧唤醒线程。`wm` 选择 `head` / `stick`：头盔方式经共用位姿映射调用 `track_pose`，摇杆方式按死区和角速度积分生成关节目标后调用 `track_joint`。摇杆方式先回中再跟随；输入/反馈中断、重定位、模式或传输身份变化后需重新触发跟随。回位事件使用 `teleop_reset_joint`；`home` 停止使用 `home_joint`，`hold` 不回零。
+
+臂型角仅在同板 D3 双臂、SDK 提供 `get_arm_angle` / `set_arm_angle`、APK 声明 `ia` / `lia` 且配置启用时生效；不满足条件则发布未启用原因，双臂继续遥操。每臂 `ArmAngleRuntime.tick()` 由本臂控制线程调用，以 20 Hz 步进，不创建线程。输入需先回中，运动功能开启且近期确有位姿派发时才调节；松键后异步读取并对齐实际臂型角。`arm_angle_state` 回传 Quest，`angle_deg` / `target_deg` 当前恒为 `null`，Qt 不显示实际角度。
+
+### 5.5 状态展示流
 
 ```text
 JoystickState
@@ -238,6 +259,8 @@ JoystickState
 ```
 
 SSE 每 50 ms 检查一次观察序列号（observation sequence）。序列变化时立即发送快照；连续 3 秒无变化时发送 heartbeat 帧。Qt 当前将顶层 `pose` 和 `button` 展示在界面中，在连接期间把 `status.device_status` 渲染到状态行右侧，回填 `status.yaw` 到标定滑条，并根据 transport 和 terminal 状态更新提示。
+
+D3 模式还展示 `status.waist` 中的模式、跟随状态、未启用原因和错误；停止期间不会把最后一帧继续显示为跟随中。
 
 ## 6. 状态与生命周期
 
@@ -319,6 +342,17 @@ Quest 连接由 `QuestInputModule.connect()` 完整管理：
 - 后端清理时尽力发送 `session_end`。
 - 无效记录返回 `protocol_error` 并终止当前连接。
 
+`hello.capabilities` 可协商 `intent_v1`、`session_setup_v1` 和 `waist_control_v1`。`hello.intents` 声明具体功能字段；旧 `intent_v1` APK 未上传该声明时仅默认核心手臂字段，新功能不会被隐式开启。
+
+| 功能 | 线字段 | 后端语义 |
+|---|---|---|
+| 右手核心功能 | `im` / `il` / `ie` / `ih` | 运动开关、旋转锁、末端值、回初始位事件 |
+| 左手核心功能 | `lim` / `lil` / `lie` / `lih` | 同上，作用于左手 |
+| 腰功能 | `wf` / `wh` / `ws`，配合 `wm` | 跟随事件、回位事件、摇杆、头盔/摇杆方式 |
+| 臂型角 | `ia` / `lia` | 右/左手臂型角摇杆输入 |
+
+模块将事件线计数转换为 lease 内累计序号，传输重连时保留累计值并重建基线。`session_setup_v1` 的板端待命与头显发起会话由 Board 组合启用；Desktop 不启动该管理器，不能据此省略 Qt 扫描和连接流程。
+
 普通传输断开进入 5 秒恢复窗口。协议错误、无效输入帧或 listener 错误属于 terminal 错误，不进入普通恢复路径。
 
 ### 7.1 设备状态
@@ -339,7 +373,7 @@ OpenXR 运行时不向应用暴露手柄电量，因此 Quest 连接就绪后由
 
 | 模式 | 行为 |
 |---|---|
-| `home` | 停止控制线程后，将机械臂移动到零关节位置，再断开 |
+| `home` | 停止控制线程后，将机械臂及已启用的腰移动到各自配置的 `home_joint`，再断开 |
 | `hold` | 停止控制线程、清除目标并断开，不发送回零运动 |
 
 界面“停止手柄遥操”先关闭本地 SSE 订阅，再请求 `home`。如果输入已经断开，controller 会将 `home` 降级为 `hold`。窗口关闭请求 `hold`，桌面 heartbeat 超时和后端退出也固定执行 `hold`。
@@ -394,14 +428,18 @@ OpenXR 运行时不向应用暴露手柄电量，因此 Quest 连接就绪后由
 | `POST /api/joystick/scan` | `current_arm_ip`、`_desktop_generation` | `data`、`arm_probe`、`allowed_profiles` | 探测机械臂并扫描 Quest |
 | `POST /api/joystick/session_config` | `mode`、`master_side`、`view_side`、`slave_ip`、`_desktop_generation` | 无额外数据 | 保存连接前配置 |
 | `POST /api/joystick/connect` | `address`、可选 `name`、`_desktop_generation` | `data.outcome`：`ready`、`pending` 或 `failed` | 连接扫描到的 Quest |
-| `POST /api/joystick/init_arm` | `mode`、`master_ip`、`slave_ip`、`master_side`、`_desktop_generation` | 无额外数据 | 创建并初始化机械臂会话 |
+| `POST /api/joystick/init_arm` | `mode`、`master_ip`、`slave_ip`、`master_side`、`_desktop_generation` | 无额外数据 | 创建并初始化机械臂会话及符合条件的腰、臂型角运行时 |
 | `POST /api/joystick/yaw` | `value` | 无额外数据 | 设置 Yaw 标定角度，`-180..180` 的整数；0 为前，+90 为左，-90 为右 |
 | `POST /api/joystick/calibration` | `value` | 无额外数据 | 兼容旧版四档标定，`0..3` 分别映射为 yaw `+90`、`-90`、`0`、`180` |
 | `POST /api/joystick/scale` | `value` | 无额外数据 | 设置灵敏度，范围 `0.1..2.0` |
+| `GET /api/joystick/move_speed` | 无 | `data.level`、`data.speed` | 读取关节运动速度档位 |
+| `POST /api/joystick/move_speed` | `value`、`_desktop_generation` | 无额外数据 | 设置 `low` / `medium` / `high`，Qt 暂无对应控件 |
 | `POST /api/joystick/view_side` | `value` | 无额外数据 | 设置兼容视图侧，`left` 或 `right` |
 | `POST /api/joystick/disconnect` | `stop_mode`、`reason`、`_desktop_generation` | `data.status` 状态对象 | 停止当前会话 |
 | `GET /api/joystick/status` | 无 | `data` 状态对象 | 获取当前状态快照 |
 | `GET /api/joystick/events` | 无 | SSE 数据流 | 订阅状态和输入快照 |
+
+设置类 POST 在 Desktop 组合中同样需要有效的 `_desktop_generation`。速度默认 `medium`，三档对应 SDK `speed=20/50/80`；旧 SDK 的 `move_joint` 无 `speed` 参数时分别使用 `desire_time=5/2/-1`。该接口控制手臂关节运动档位，不改变位姿灵敏度、腰速度或臂型角速度。Desktop 不注册 `include_maintenance_routes` 控制的初始化位置维护与关节读取接口。
 
 ### 9.3 扫描响应
 
@@ -440,6 +478,9 @@ OpenXR 运行时不向应用暴露手柄电量，因此 Quest 连接就绪后由
 - `capabilities`：当前输入源的能力位；`arm_profile`：当前输入源支持的型号与模式
 - `master_arm`、`slave_arm`
 - 当前 view side 的 `pose`、`button`
+- 当前 view side 的 `intent`：运动、旋转锁、末端、回位累计序号与臂型角摇杆
+- `waist`：腰模式、状态、跟随标记及错误；`head_pose` / `body_intent`：头盔腰输入和腰功能结果
+- `direct`：板端直连状态结构；Desktop 不启动直连管理器，其 `active` 保持 `false`
 - `transport.state`、`protocol`、`connection_id`、`last_rx_age_ms`、`disconnect_reason`
 - controller 不可用时附带 `available: false`
 
@@ -466,13 +507,17 @@ GET /api/joystick/events
 Accept: text/event-stream
 ```
 
-变化帧的顶层结构：
+变化帧的结构（机械臂绑定、直连配置等对象省略内部细节）：
 
 ```json
 {
   "sequence": 1,
   "pose": null,
   "button": null,
+  "intent": null,
+  "head_pose": null,
+  "body_intent": null,
+  "direct": {"active": false},
   "status": {
     "ble_connected": true,
     "status": "connected",
@@ -481,6 +526,7 @@ Accept: text/event-stream
     "scale": 0.4,
     "arm_initialized": false,
     "device_status": [],
+    "waist": {"status": "unavailable", "following": false, "error": null},
     "source_type": "quest",
     "mode": "single",
     "master_side": "right",
@@ -515,11 +561,13 @@ Accept: text/event-stream
   "hands": {
     "left": {
       "pose": null,
-      "button": null
+      "button": null,
+      "intent": null
     },
     "right": {
       "pose": null,
-      "button": null
+      "button": null,
+      "intent": null
     }
   },
   "stream_terminal": false,
@@ -549,9 +597,11 @@ trigger, grip, btn_xa, btn_yb, btn_menu, btn_system,
 joystick_x, joystick_y, joystick_z, menu_capture, timestamp
 ```
 
+顶层 `intent` 与视角手的 `hands.<side>.intent` 一致，包含 `motion_engaged`、`rotation_locked`、`end_effector`、`home_sequence`、`arm_angle_stick`，功能结果与原始 `button` 分开发布。`head_pose` 含 `mode`、七分量位姿、`valid`、`recenter_count`；`body_intent` 含两个腰事件累计序号和 `waist_stick`。无相应输入时为 `null`。`status.waist` 发布腰状态，运行时还带 `mode`；`direct` 保留板端直连状态结构，但 Desktop 的 `active` 为 `false`。
+
 未连接输入源时 `capabilities` 和 `arm_profile` 为 `null`。`hands` 中只有输入源提供关节目标时才出现 `joint`。
 
-连续 3 秒没有新的 sequence 时，服务发送 `heartbeat: true`，并将该帧顶层 `pose`、`button` 设为 `null`。会话终止时 `stream_terminal=true`；需要发送最终断连帧时 `emit_disconnect_frame=true`，发送后关闭 SSE 流。
+连续 3 秒没有新的 sequence 时，服务发送 `heartbeat: true`，并将该帧顶层 `pose`、`button`、`intent`、`head_pose`、`body_intent` 设为 `null`。会话终止时 `stream_terminal=true`；需要发送最终断连帧时 `emit_disconnect_frame=true`，发送后关闭 SSE 流。
 
 ## 11. 配置与日志
 
@@ -561,6 +611,12 @@ joystick_x, joystick_y, joystick_z, menu_capture, timestamp
 - `quest_pose_jump.rotation_threshold_deg`
 - `models.<型号>.single.init_joint`：`A3_C`、`A3_T`、`A3_S` 的单臂初始化关节
 - `models.<型号>.dual.left|right.init_joint`：各型号双臂左右侧初始化关节；`D3` 只有 `dual`
+- 各臂配置同层的 `home_joint` 与 `teleop_reset_joint`：停止回零与遥操中回位目标，省略时分别为全零与 `init_joint`
+- `models.D3.waist`：`enabled`、两轴 `init_joint` / `teleop_reset_joint` / `home_joint`、`max_speed_deg_s`、`deadzone`
+- `models.D3.arm_angle`：`enabled`、`deadzone`、`max_speed_deg_s`、`min_deg` / `max_deg`、`min_step_deg`
+- 可选 `sdk.shared_connection`：默认 `true`
+
+关节目标使用弧度；角度范围和角速度以字段中的 `_deg` / `_deg_s` 为单位。当前配置开启 D3 腰和臂型角，但硬件与 APK 准入仍逐次检查。腰目标默认均为 `[0, 0]`，摇杆死区 `0.15`、最大速度 `10°/s`；臂型角死区 `0.15`、最大速度 `45°/s`、范围 `-170..170°`、最小下发步长 `0.2°`。腰与手臂共用灵敏度和 Yaw，旧腰 `scale` 字段已被忽略。
 
 `JoystickConfigSnapshot.resolve_arm(model, mode, side)` 按 `型号 -> 模式 -> 臂侧` 解析并校验数值与数组长度。旧版 `single_arm` / `dual_arm`（`six_axis` / `seven_axis`）结构不再被读取。
 

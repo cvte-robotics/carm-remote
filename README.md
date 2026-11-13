@@ -10,6 +10,10 @@ CARM Quest Desktop 是一个 Quest 手柄遥操桌面应用，可在图形界面
 - 灵敏度（0.1–2.0）和 Yaw 标定角度（-180°–180°）调整
 - Quest 头盔与左右手柄电量显示
 - 手柄位置、按钮数据和运行日志查看
+- D3 腰控制状态展示；兼容 APK 可通过头盔或绑定摇杆控制两轴腰
+- D3 双臂臂型角摇杆调节（需 APK 声明功能且 SDK 提供对应接口）
+
+本文与开发文档对应的源码同步基线见 [整体架构](docs/ARCHITECTURE.md)。
 
 ## 运行要求
 
@@ -44,7 +48,7 @@ Quest 对应行的状态应为 `device`。
 
 ## Python 依赖
 
-依赖版本以 [qt_app/requirements.txt](qt_app/requirements.txt) 和 [qt_app/pyproject.toml](qt_app/pyproject.toml) 为准。
+启动脚本从 [qt_app/requirements.txt](qt_app/requirements.txt) 安装以下运行依赖：
 
 | 依赖 | 版本 | 用途 |
 |---|---|---|
@@ -52,12 +56,12 @@ Quest 对应行的状态应为 `device`。
 | Flask | `>=2.2,<4` | 本机后台接口 |
 | Werkzeug | `>=2.2,<4` | 运行本机后端服务 |
 | carm | `>=0.1.20260819` | 机械臂连接与控制 |
-| NumPy | Python 3.8：`==1.24.4`；Python 3.9 及以上：`==1.26.4` | 位姿和矩阵计算 |
-| SciPy | Python 3.8：`==1.10.1`；Python 3.9 及以上：`==1.11.4` | 旋转与四元数计算 |
 | websocket-client | `>=1.6,<2` | 启动检查要求的运行依赖 |
 | zeroconf | `>=0.130,<1` | 启动检查要求的运行依赖 |
 
 其余依赖按上表的版本范围由 pip 自动选择与当前 Python 兼容的版本；例如在 Python 3.8 上会安装 PyQt6 6.7.x、Flask 3.0.x。
+
+位姿映射使用 Python 标准库，不需要 NumPy/SciPy；依赖声明、平台启动探测与 preflight 已统一为上述运行依赖。
 
 无需提前手动安装这些 Python 包。启动脚本会创建独立虚拟环境，并在依赖缺失时自动执行安装：
 
@@ -168,6 +172,14 @@ qt_app\.venv-windows\Scripts\python.exe qt_app\scripts\collect_data.py --single-
 
 后端同一时间只执行一个用户操作（扫描、连接、初始化、停止等）；操作进行中再次提交会被直接拒绝，不会排队。
 
+### 手臂、腰与臂型角
+
+支持 `intent_v1` 的 APK 上传运动开关、旋转锁、末端触发值和回初始位事件等功能结果；实际按键绑定与按住/切换方式以头显内配置为准。未声明该能力的旧 APK 仍使用后端的原始按键适配。不要把原始 Grip 或 A/B/X/Y 显示值当作新版 APK 的最终控制意图。
+
+D3 腰控制需要同板双臂、两轴腰硬件、已启用的腰配置，以及声明 `waist_control_v1` 和腰功能字段的 APK。初始化后通过头显中绑定的腰跟随键启停：头盔方式按相对位姿跟随，摇杆方式需先回中，再用绑定的摇杆控制。输入中断、重定位或方式变化会停止跟随，恢复后必须再次触发腰跟随键。腰回位键使用 `teleop_reset_joint`，停止时的 `home` 清理使用 `home_joint`。不支持腰的旧 APK 或确认无腰硬件时，双臂仍可遥操。
+
+臂型角调节仅对满足条件的同板 D3 双臂启用。APK 需声明左右臂型角输入，SDK 需提供读写接口；运动功能开启且本臂正在跟随时，推动对应摇杆可调节，松键后对齐实际臂型角。当前 Qt 不显示实际臂型角数值。
+
 ## 配置
 
 运行配置位于 [config/joystick_config.json](config/joystick_config.json)，包括：
@@ -176,6 +188,13 @@ qt_app\.venv-windows\Scripts\python.exe qt_app\scripts\collect_data.py --single-
 - 按机械臂型号划分的初始化关节位置（`models.<型号>.<模式>[.<臂侧>].init_joint`）：
   - `A3_C`、`A3_T`、`A3_S`：`single` 单臂，以及 `dual.left` / `dual.right` 双臂，各 6 个关节
   - `D3`：仅 `dual.left` / `dual.right`，各 7 个关节
+- 同一位置的 `home_joint`：停止时 `home` 清理使用的关节目标；省略时为全零
+- 同一位置的 `teleop_reset_joint`：遥操中回初始位事件使用的目标；省略时沿用 `init_joint`
+- `models.D3.waist`：腰开关、两轴初始化/回初始位/停止目标、摇杆死区与最大角速度；头盔方式与手臂共用灵敏度和 Yaw
+- `models.D3.arm_angle`：臂型角开关、死区、速度、角度范围和最小下发步长
+- 可选 `sdk.shared_connection`：同一控制端点的臂与腰共用 SDK 连接，默认 `true`
+
+关节目标数组使用弧度；带 `_deg` 或 `_deg_s` 的参数使用度或度/秒。当前默认 D3 腰的三个关节目标均为 `[0, 0]`，臂型角范围为 `-170..170°`。修改前应核对当前设备与场景所需的目标。
 
 机械臂型号由扫描时读取的名称和自由度识别：名称须唯一包含 `A3` 或 `D3`，A3 还须唯一包含 `C`、`T`、`S` 之一；A3 为 6 轴，D3 为 7 轴。识别失败或轴数不符时扫描会报错。
 

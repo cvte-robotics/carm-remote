@@ -141,7 +141,7 @@ class SessionCleanup:
         except Exception:
             logging.exception("[SessionCleanup] ArmSession cleanup failed")
             return False
-        if success and not session.arms:
+        if success and not session.has_resources:
             owner.session = None
             owner.controller = None
         else:

@@ -1,19 +1,21 @@
 """每手单槽最新值信箱与冻结输入帧（joystick 控制热路径）。
 
-``LatestValueCell`` 只依赖单属性赋值的原子性：每个槽保证读到完整的冻结帧；
-帧与 policy/会话状态的配对由发布侧提交规则保证（store 与 policy 推进同一
-``_policy_lock`` 临界区）。帧内只放不可变对象；一次批次一次落地（双手同批），
-观测读者读与序号成对提交的镜像。
+``LatestValueCell`` 只依赖单属性赋值的原子性：每个槽保证读到完整的冻结帧。
+输入线程独占发布值的读改写；其他线程只能在会话 data 锁内 clear。
+一次批次一次落地保证双手同批，控制与观测读者都按当前 binding 的 lease 过滤。
 """
 
 import threading
 from dataclasses import dataclass, replace
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional
 
 from carm_teleop_input_contracts import (
     HAND_LEFT,
     HAND_RIGHT,
     ButtonSample,
+    HandIntentSample,
+    WaistControlSample,
+    BodyIntentSample,
     JointTargetSample,
     PoseSample,
     ReengageStatus,
@@ -23,7 +25,7 @@ from carm_teleop_input_contracts import (
 
 
 class LatestValueCell:
-    """单写者/单读者、最新值胜出的单槽信箱。
+    """单写者/多读者、最新值胜出的单槽信箱。
 
     写者：provider 回调线程（``store``）；读者：控制线程或 SSE 快照线程
     （``load``）。``clear`` 也只在上述写者/持有相关临界区的路径上调用。
@@ -51,8 +53,7 @@ class LatestValueCell:
 class PublicationSignal:
     """输入发布计数 + 唤醒：发布侧 ``notify``，控制线程 ``wait_newer`` 等待新发布。
 
-    只是唤醒提示，不携带数据；读者醒来后仍从信箱读最新帧。内部锁是叶子锁，
-    ``notify`` 不得在持有 gate（``_policy_lock``）时调用。
+    只是唤醒提示，不携带数据；读者醒来后仍从信箱读最新帧。通知在帧落地后进行。
     """
 
     def __init__(self) -> None:
@@ -62,9 +63,8 @@ class PublicationSignal:
 
     @property
     def sequence(self) -> int:
-        """当前发布序号（单调递增）。"""
-        with self._condition:
-            return self._sequence
+        """无锁读取当前发布序号；写入仍由 condition 串行化。"""
+        return self._sequence
 
     def notify(self) -> None:
         """推进发布序号并唤醒全部等待者。"""
@@ -83,8 +83,8 @@ class PublicationSignal:
 @dataclass(frozen=True)
 class HandInputFrame:
     """
-一只手的最新接受输入帧：``pose``/``button`` 独立接受（位姿无效帧不阻塞按钮刷新），
-``control_sample`` 仅在位姿与按钮均被接受时更新。冻结对象整体替换。
+一只手的最新接受输入帧：pose 与 button/intent 独立接受；按钮和功能结果成对刷新。
+``control_sample`` 仅在位姿与按钮/功能结果均被接受时更新。冻结对象整体替换。
 """
 
     hand: str
@@ -94,6 +94,8 @@ class HandInputFrame:
     input_sequence: int
     lease: Optional[SourceLease]
     timestamp_monotonic: float
+    discontinuity_seq: int = 0
+    intent: Optional[HandIntentSample] = None
 
 
 def _hand_frame(publication, hand: str):
@@ -113,9 +115,10 @@ def _with_hand_frame(publication, hand: str, frame):
 @dataclass(frozen=True)
 class InputPublication:
     """
-一次输入批次对外可见的双手同批冻结快照：写者 gate 临界区内一次 ``store``，
+一次输入批次对外可见的双手同批冻结快照：输入线程一次 ``store``，
 读者一次 ``load`` 即得双手同批的帧（单手更新批次里另一手携带上一 publication
 的同一帧对象）。``batch_sequence``/``lease``/``timestamp_monotonic`` 为批次元数据。
+``waist_input``/``body_intent`` 为批次级输入，``transport_generation`` 用于识别重连换代。
 """
 
     left: Optional[HandInputFrame]
@@ -123,6 +126,9 @@ class InputPublication:
     batch_sequence: int
     lease: Optional[SourceLease]
     timestamp_monotonic: float
+    waist_input: Optional[WaistControlSample] = None
+    body_intent: Optional[BodyIntentSample] = None
+    transport_generation: int = 0
 
     def frame(self, hand: str) -> Optional[HandInputFrame]:
         """取本批次中某一手的输入帧（另一手帧不受影响）。"""
@@ -132,18 +138,6 @@ class InputPublication:
         """置换单手帧，返回新的 publication（其余字段与另一手帧原样保留）。"""
         return _with_hand_frame(self, hand, frame)
 
-    def without_display(self) -> "InputPublication":
-        """清空双手帧的位姿/按钮显示槽位；无需清空时返回原对象（身份不变）。"""
-        changed = False
-        frames = {}
-        for hand, frame in ((HAND_LEFT, self.left), (HAND_RIGHT, self.right)):
-            if frame is not None and (frame.pose is not None or frame.button is not None):
-                frame = replace(frame, pose=None, button=None)
-                changed = True
-            frames[hand] = frame
-        if not changed:
-            return self
-        return replace(self, left=frames[HAND_LEFT], right=frames[HAND_RIGHT])
 
 
 @dataclass(frozen=True)
@@ -154,11 +148,12 @@ class JointInputFrame:
     batch_sequence: int
     target: Optional[JointTargetSample]
     received_monotonic: float
+    discontinuity_seq: int = 0
 
 
 @dataclass(frozen=True)
 class JointPublication:
-    """一次关节批次的双手同批冻结快照（r5，P2）。"""
+    """一次关节批次的双手同批冻结快照。"""
 
     left: Optional[JointInputFrame]
     right: Optional[JointInputFrame]
@@ -169,9 +164,6 @@ class JointPublication:
         """取本批次中某一手的关节帧（另一手帧不受影响）。"""
         return _hand_frame(self, hand)
 
-    def with_frame(self, hand: str, frame: Optional[JointInputFrame]) -> "JointPublication":
-        """置换单手帧，返回新的 publication（诊断与内部改写用）。"""
-        return _with_hand_frame(self, hand, frame)
 
 
 def reengage_payload(status: Optional[ReengageStatus]) -> Optional[dict]:

@@ -1,60 +1,48 @@
-"""手柄遥操控制算法核心（输入位姿 → 机械臂目标的映射与 SDK 派发事务）。
+"""手柄输入到机械臂目标的映射与发送。
 
-``ControlEpoch`` / ``TargetState`` 以对象身份作为失效依据；SDK 派发经
-generation-bound 接口在 Host 锁外完成“发送前复核 + 物理发送 + 提交”。本模块不持
-Host data 锁，只使用 ``pose_state_lock``（锁序 ``pose_state_lock → _policy_lock``）。
+运行中的映射只由所属臂控制线程修改；连接身份和反馈代次仍在 SDK 发送前检查。
+SDK 返回精确 True 后才提交分段基线，不再依赖输入侧失效事务。
 """
 
 import logging
 import math
-import numbers
 import threading
 import time
-from concurrent.futures import CancelledError as FuturesCancelledError, TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, List, Tuple
+from typing import Any, Optional, List, Tuple
 
 from ..runtime.dependencies import (
-    ARM_SDK_AVAILABLE, Carm, CarmSdk, DEPENDENCIES_AVAILABLE, np, R,
+    ARM_SDK_AVAILABLE, Carm, MOVE_SPEED_LEVELS,
 )
 from carm_teleop_input_contracts import (
     ButtonSample,
-    HAND_LEFT,
+    HandIntentSample,
     HAND_RIGHT,
     PoseSample,
     normalize_hand,
 )
 from ..runtime.config import identify_arm_model
-from .pose_math import (
-    _continuous_pose_diff_with_scale,
-    _is_valid_joint_position,
-    apply_pose_delta,
-    project_input_to_arm,
-)
+from .joint_motion import JointMotionWatch
+from .pose_mapping import PoseMapping, select_output_baseline
+from .pose_math import _is_valid_joint_position, input_pose_to_arm
 
 
-_POSE_SEGMENT_ANGLE_RAD = math.radians(150.0)
-_POSE_SEGMENT_ANGLE_ATOL_RAD = 1e-9
+# 手臂姿态 1:1 跟随，灵敏度 scale 只缩放位置：姿态只取决于手柄当前位姿，不随路径累积偏差。
+_ROTATION_SCALE = 1.0
+# 回初始位序号基线未建立（与"身份为 None"区分）。
+_HOME_UNSET = object()
 
-
-@dataclass(frozen=True)
-class ControlEpoch:
-    """控制纪元：对象身份即纪元（复核点比较 ``is``，不比较 serial）。
-
-    在途操作复核点必须连同 binding 身份、ControlParams、arm_connection_generation
-    一起比较，不得只比较 current_epoch 身份。
-    """
-
-    serial: int
+DEFAULT_MOVE_SPEED_LEVEL = "medium"
+# move_joint 的名义窗口，只防止与 track_pose 重叠，不是到位判定。
+MOVE_JOINT_WINDOW_S = 5.0
 
 
 @dataclass(frozen=True)
 class ControlParams:
     """Host 发布的冻结输入映射参数。
 
-    ``epoch`` 只在 yaw 标定或灵敏度 scale 变化时推进；其余失效事件由 binding
-    会话身份或 ``ControlEpoch`` 对象身份承载。冻结样本与派发 attempt 都会携带
-    计算时使用的 epoch，因此过期参数集不可能被静默复用。
+    ``epoch`` 只在 yaw 标定或灵敏度 scale 变化时推进。控制线程在周期开始按
+    对象身份接收变化，整个周期使用同一份参数。
     """
 
     epoch: int
@@ -65,25 +53,21 @@ class ControlParams:
 @dataclass(frozen=True)
 class ControlSample:
     """
-一个控制周期冻结的输入样本（本周期位姿/按钮/参数的完整凭证）。
+一个控制周期冻结的输入样本（本周期位姿/按钮/功能结果/参数的完整凭证）。
 
-``params``/``epoch`` 为计算时参数与纪元，``session_id``/``input_source``/
-``source_lease``/``source_token`` 为来源身份，``arm_connection_generation``/
-``arm_feedback_state_sequence``/``arm_feedback_fresh`` 为机械臂反馈身份。
+``params`` 为本周期冻结的映射参数，``arm_connection_generation``/
+``arm_feedback_state_sequence``/``arm_feedback_fresh`` 为机械臂反馈身份；
+``home_identity`` 标识回初始位序号所属的输入（会话与 lease）。
 """
 
     pose_data: Optional[PoseSample]
     button_data: Optional[ButtonSample]
     params: ControlParams
-    input_sequence: int
-    session_id: int
-    input_source: str
-    source_lease: Any
-    source_token: Any
-    epoch: ControlEpoch
     arm_connection_generation: int
     arm_feedback_state_sequence: Optional[int]
     arm_feedback_fresh: bool
+    intent_data: Optional[HandIntentSample] = None
+    home_identity: Any = None
 
 
 @dataclass(frozen=True)
@@ -94,76 +78,21 @@ class ControlComputation:
 
 
 @dataclass(frozen=True)
-class TargetState:
-    """
-一个冻结的位姿目标及计算凭证：对象身份即目标身份，派发复核按对象身份比较。
-
-``reject_pose_target()`` 只清 target（不换 epoch）；``invalidate_pose_mapping()``
-换 epoch 并清空。
-"""
-
-    epoch: ControlEpoch
-    pose: Tuple[float, ...]
-    input_sequence: Any
-    session_id: Any
-    params_epoch: Any
-    input_source: Any
-    arm_connection_generation: Any
-    arm_feedback_state_sequence: Optional[int]
-    source_token: Any
-    end_effector_trigger: Any
-
-
-@dataclass(frozen=True)
-class DispatchAttempt:
-    """
-一次已准入的位姿派发事务（在 Host 锁外执行的冻结凭证）。
-
-全部字段在 ``pose_state_lock`` 临界区内捕获，物理派发与 post 复核不取 Host 锁：
-``target_state`` 为目标身份，``carm``/``arm_ws_identity``/``arm_state_identity``
-为连接身份，``pending_*`` 为成功后才提交的基线。
-"""
-
-    target_state: TargetState
-    epoch: ControlEpoch
-    carm: Any
-    arm_ws_identity: Any
-    arm_state_identity: Any
-    arm_connection_generation: Any
-    arm_feedback_state_sequence: Optional[int]
-    end_effector_driver: Any
-    hand_binding: str
-    arm_role: str
-    pending_input_pose: Any
-    pending_target_pose: Any
-
-
-@dataclass(frozen=True)
 class JointMoveAttempt:
-    """一次已准入的关节运动派发事务（A 键回零点路径）。
-
-    ``joints`` 是待发送的关节值；``epoch`` / ``session_id`` / ``params_epoch`` /
-    ``input_source`` / ``arm_connection_generation`` 与 ``carm`` /
-    ``arm_ws_identity`` / ``arm_state_identity`` 是准入复核所用的完整身份。
-    """
+    """A 键关节运动的命令与臂连接快照。"""
 
     joints: Tuple[float, ...]
-    epoch: ControlEpoch
-    session_id: int
-    params_epoch: int
-    input_source: str
     arm_connection_generation: int
     carm: Any
     arm_ws_identity: Any
-    arm_state_identity: Any
 
 
 class CommandController:
     """单臂控制算法核心（输入位姿 → 目标 pose / 关节指令）。
 
     绑定一只 hand 与一个 arm_role，持有该臂的位姿映射状态与机械臂连接身份。
-    位姿映射状态只在 ``pose_state_lock`` 内读写；物理派发在锁外执行，由 attempt
-    身份复核兜底。
+    运行中的位姿映射由所属控制线程独占，SDK 派发保留连接身份保护。
+    生命周期线程只能在控制线程退出后执行停止收尾。
     """
 
     def __init__(
@@ -176,10 +105,10 @@ class CommandController:
         self.isStop = False
         self.end_arm_pose = [0, 0, 0, 0, 0, 0, 1]
         self.scale = scale
+        self.move_speed = MOVE_SPEED_LEVELS[DEFAULT_MOVE_SPEED_LEVEL]
         self.hand_binding = normalize_hand(hand_binding, HAND_RIGHT)
         self.arm_role = arm_role
         self.default_init_joint = [-0.000192, 1.56713, -0.956551, 0.018883, 0.907339, -0.004005]
-        self.seven_axis_init_joint = [0, 0, 0, -1.57, 0, 0, 0]
         self.init_joint_ = (
             list(configured_init_joint)
             if configured_init_joint is not None
@@ -188,15 +117,18 @@ class CommandController:
 
         self.zero_joint = [0,0,0,0,0,0]
         self.seven_axis_zero_joint = [0,0,0,0,0,0,0]
+        # 由会话按配置注入；None 时分别回退为全零与 init_joint_。
+        self.home_joint_ = None
+        self.teleop_reset_joint_ = None
 
-        self.init_end_vr_pose = None
-        self.init_end_arm_pose = None
-        self.current_target: Optional[TargetState] = None
-        self.relative_quaternion = None
-        self.pending_pose_segment = None
-        self.pose_state_lock = threading.RLock()
-        self._epoch_serial = 0
-        self.current_epoch = ControlEpoch(serial=self._epoch_serial)
+        self.mapping = PoseMapping()
+        # 最近一次成功下发的目标；连接变化或关节运动后失效。
+        self._last_committed_target = None
+        # 最近接受的反馈帧里控制器是否在执行任务。
+        self._controller_tracking = False
+        # 目标只在本臂控制线程内短暂存在；字段值为普通映射，包含派发所需的
+        # 位姿、反馈身份和末端触发值。
+        self.current_target = None
         self.arm_connection_generation = 0
         self.arm_feedback_state_sequence = 0
         self.arm_feedback_connection_generation = None
@@ -206,13 +138,22 @@ class CommandController:
         self._arm_ws_identity = None
         self._arm_state_identity = None
         self._arm_connected = False
-        self.zero_quat = [0, 0, 0, 1]
 
-        self.last_aButton = False
+        self._home_identity = _HOME_UNSET
+        self._home_sequence = None
         self.last_bButton = False
         self.need_sync_feedback = False
         self.carm_ = None
+        # 共享 SDK 连接时由主控制器注入通道工厂；None 时每臂独立 Carm 连接。
+        self.carm_factory = None
         self._pending_joint_move = None
+        # 进行中的回位运动及其所属臂连接代次；结束前不建基线、不发跟随命令。
+        self._home_motion = None
+        self._home_motion_generation = None
+        # 最近一次触发的初始化/回零运动的窗口截止时刻。
+        self._motion_deadline = None
+        # 最近一次 track_pose 成功写入连接的时刻；臂型角据此判断手臂是否在跟随。
+        self._last_pose_dispatch = None
         self.end_effector_driver = None
         self.carm_device_index = None
         self.use_seven_axis_joints = False
@@ -234,81 +175,27 @@ class CommandController:
         return self.init_joint_.copy()
 
     def _active_zero_joint(self) -> list:
-        """返回当前臂型对应的零点关节值副本。"""
+        """返回当前生效的回零位置副本；未配置时为当前臂型的全零关节值。"""
+        if self.home_joint_ is not None:
+            return self._validated_joint_copy(self.home_joint_, "回零位置")
         if self._expected_joint_count() == 7:
             return self.seven_axis_zero_joint.copy()
-        return self.zero_joint
+        return self.zero_joint.copy()
 
-    def _with_temp_arm_connection(
-        self,
-        control_host: str,
-        operation,
-        device_index: Optional[int] = None,
-    ):
-        """使用明确的控制端点建立临时机械臂连接。"""
-        temp_carm = None
-        try:
-            if not ARM_SDK_AVAILABLE or Carm is None:
-                raise RuntimeError("Pure Python Carm SDK is unavailable")
-            temp_carm = (
-                Carm(control_host)
-                if device_index is None
-                else Carm(control_host, device_index)
+    def _active_teleop_reset_joint(self) -> list:
+        """返回遥操中回初始位的目标副本；未配置时与初始化位置相同。"""
+        if self.teleop_reset_joint_ is not None:
+            return self._validated_joint_copy(self.teleop_reset_joint_, "遥操回初始位位置")
+        return self._active_init_joint()
+
+    def _validated_joint_copy(self, joints, label: str) -> list:
+        """校验关节值长度与当前臂型一致后返回副本。"""
+        expected_joint_count = self._expected_joint_count()
+        if len(joints) != expected_joint_count:
+            raise RuntimeError(
+                f"机械臂{label}配置长度错误：期望 {expected_joint_count}，实际 {len(joints)}"
             )
-            if temp_carm is None:
-                raise RuntimeError(f"Failed to create Carm instance for {control_host}")
-
-            time.sleep(0.2)
-            if not temp_carm.is_connected():
-                if not temp_carm.connect(timeout=1.0):
-                    raise ConnectionError(f"Failed to connect to {control_host}")
-
-            return operation(temp_carm)
-
-        finally:
-            if temp_carm is not None:
-                try:
-                    temp_carm.disconnect()
-                    logging.debug(
-                        "[CommandController] Temporary connection to %s (arm_index=%s) disconnected",
-                        control_host,
-                        device_index,
-                    )
-                except Exception as e:
-                    logging.warning(f"[CommandController] Error disconnecting temporary connection: {e}")
-
-    def confirmInitPosition(self, control_host: str) -> bool:
-        """读取当前机械臂位置并覆盖本进程的初始化位置。"""
-        try:
-            def read_position(carm):
-                """读取当前关节值并覆盖本进程的初始化位置。"""
-                self.arm_model = identify_arm_model(carm.arm_name, carm.arm_dof)
-                if self.arm_model == "D3":
-                    raise ValueError("D3 不支持单臂初始化位置确认")
-                temp_joint = carm.joint_pos
-                if not _is_valid_joint_position(temp_joint, 6):
-                    logging.error(f"[CommandController] Invalid joint position data: {temp_joint}")
-                    return False
-
-                self.init_joint_ = list(temp_joint)
-                logging.warning(f"[CommandController] Init position confirmed and cached: {self.init_joint_}")
-                return True
-
-            return self._with_temp_arm_connection(control_host, read_position)
-        except ConnectionError as e:
-            logging.error(f"[CommandController] {e}")
-            return False
-        except Exception as e:
-            logging.error(f"[CommandController] Error confirming init position: {e}")
-            logging.exception(e)
-            return False
-
-    def getInitPosition(self) -> dict:
-        """获取当前生效的初始化位置。"""
-        logging.warning(f"[CommandController] Getting init position: {self.init_joint_}")
-        if self.init_joint_ is None:
-            return {"init_joint": None}
-        return {"init_joint": self.init_joint_}
+        return list(joints)
 
     def load_cached_init_position(self, cached_position) -> bool:
         """存在接口缓存时覆盖配置初始化值，否则保留配置或原生默认值。"""
@@ -322,43 +209,6 @@ class CommandController:
         except Exception as e:
             logging.error(f"[CommandController] Error loading cached init position: {e}")
         return False
-
-    def getCurrentJoints(self, control_host: str) -> dict:
-        """通过当前控制器的设备索引读取六轴或七轴关节值。"""
-        try:
-            expected_joint_count = self._expected_joint_count()
-
-            def read_joints(carm):
-                """通过临时连接读取当前六轴/七轴关节值。"""
-                self.arm_model = identify_arm_model(carm.arm_name, carm.arm_dof)
-                if self.arm_model == "D3":
-                    raise ValueError("D3 不支持单臂初始化位置确认")
-                temp_joint = carm.joint_pos
-                if not _is_valid_joint_position(temp_joint, expected_joint_count):
-                    logging.error(
-                        "[CommandController] Invalid joint position data: expected=%d actual=%s",
-                        expected_joint_count,
-                        temp_joint,
-                    )
-                    return {"current_joints": None, "error": "Invalid joint position data"}
-
-                logging.warning(f"[CommandController] Getting current joints: {temp_joint}")
-                return {"current_joints": list(temp_joint)}
-
-            return self._with_temp_arm_connection(
-                control_host,
-                read_joints,
-                device_index=self.carm_device_index,
-            )
-
-        except ConnectionError as e:
-            error_msg = f"[CommandController] {e}"
-            logging.error(error_msg)
-            return {"current_joints": None, "error": error_msg}
-        except Exception as e:
-            error_msg = f"[CommandController] Error getting current joints: {e}"
-            logging.exception(e)
-            return {"current_joints": None, "error": error_msg}
 
     @staticmethod
     def _validated_arm_pose(state, arm_index):
@@ -399,86 +249,89 @@ class CommandController:
         """只接受当前 SDK 连接送达的、尚未消费过的合法 state 帧。
 
         ws 身份变化、连接断开、连接新建立都会推进 ``arm_connection_generation``
-        并调用 ``invalidate_pose_mapping()``，从而作废全部在途 attempt。
+        并调用 ``invalidate_pose_mapping()``，要求下一输入从新鲜反馈重新同步。
 
         Returns:
             bool：接受了新的合法反馈帧并刷新 ``end_arm_pose`` 时为 True；
             无新帧、帧非法或连接未就绪时为 False
         """
-        with self.pose_state_lock:
-            if not self.carm_:
-                return False
+        if not self.carm_:
+            return False
 
-            try:
-                connected = bool(self.carm_.is_connected())
-                ws_identity = getattr(self.carm_, "ws", None)
-                state_identity = getattr(self.carm_, "state", None)
-            except Exception as e:
-                logging.debug(f"[CommandController] Failed to inspect arm connection: {e}")
-                return False
+        try:
+            connected = bool(self.carm_.is_connected())
+            ws_identity = getattr(self.carm_, "ws", None)
+            state_identity = getattr(self.carm_, "state", None)
+        except Exception as e:
+            logging.debug(f"[CommandController] Failed to inspect arm connection: {e}")
+            return False
 
-            if ws_identity is not self._arm_ws_identity:
-                self._arm_ws_identity = ws_identity
-                self._arm_state_identity = state_identity
-                self._arm_connected = False
-                self.arm_feedback_connection_generation = None
-                self.arm_connection_generation += 1
-                self.invalidate_pose_mapping()
-
-            if not connected:
-                if self._arm_connected:
-                    self._arm_connected = False
-                    self._arm_state_identity = state_identity
-                    self.arm_feedback_connection_generation = None
-                    self.arm_connection_generation += 1
-                    self.invalidate_pose_mapping()
-                return False
-
-            if not self._arm_connected:
-                self._arm_connected = True
-                self._arm_state_identity = state_identity
-                self.arm_feedback_connection_generation = None
-                self.arm_connection_generation += 1
-                self.invalidate_pose_mapping()
-                return False
-
-            if state_identity is self._arm_state_identity:
-                return False
-
-            try:
-                if (
-                    self.carm_.ws is not ws_identity
-                    or not self.carm_.is_connected()
-                    or self.carm_.state is not state_identity
-                ):
-                    return False
-            except Exception as e:
-                logging.debug(f"[CommandController] Arm feedback changed during snapshot: {e}")
-                return False
-
+        if ws_identity is not self._arm_ws_identity:
+            self._arm_ws_identity = ws_identity
             self._arm_state_identity = state_identity
-            self.arm_feedback_state_sequence += 1
-            arm_index = getattr(self.carm_, "arm_index", 0)
-            current_pose = self._validated_arm_pose(state_identity, arm_index)
-            if current_pose is None:
-                self.arm_feedback_connection_generation = None
-                self.invalidate_pose_mapping()
-                logging.warning(
-                    "[CommandController] Ignoring invalid arm feedback "
-                    "(generation=%d, sequence=%d)",
-                    self.arm_connection_generation,
-                    self.arm_feedback_state_sequence,
-                )
-                return False
+            self._arm_connected = False
+            self._on_arm_connection_changed()
 
-            self.end_arm_pose = current_pose
-            self.arm_feedback_connection_generation = self.arm_connection_generation
-            # 接受时刻快照：记录本帧被接受时的 ws/state 身份与时钟；须与关节值
-            # 配对使用，改读实时值会把旧反馈绑到重连后的新连接上。
-            self.arm_feedback_ws_identity = ws_identity
-            self.arm_feedback_state_identity = state_identity
-            self.arm_feedback_accept_monotonic = time.monotonic()
-            return True
+        if not connected:
+            if self._arm_connected:
+                self._arm_connected = False
+                self._arm_state_identity = state_identity
+                self._on_arm_connection_changed()
+            return False
+
+        if not self._arm_connected:
+            self._arm_connected = True
+            self._arm_state_identity = state_identity
+            self._on_arm_connection_changed()
+            return False
+
+        if state_identity is self._arm_state_identity:
+            return False
+
+        try:
+            if (
+                self.carm_.ws is not ws_identity
+                or not self.carm_.is_connected()
+                or self.carm_.state is not state_identity
+            ):
+                return False
+        except Exception as e:
+            logging.debug(f"[CommandController] Arm feedback changed during snapshot: {e}")
+            return False
+
+        self._arm_state_identity = state_identity
+        self.arm_feedback_state_sequence += 1
+        arm_index = getattr(self.carm_, "arm_index", 0)
+        current_pose = self._validated_arm_pose(state_identity, arm_index)
+        if current_pose is None:
+            self.arm_feedback_connection_generation = None
+            self.invalidate_pose_mapping()
+            logging.warning(
+                "[CommandController] Ignoring invalid arm feedback "
+                "(generation=%d, sequence=%d)",
+                self.arm_connection_generation,
+                self.arm_feedback_state_sequence,
+            )
+            return False
+
+        self.end_arm_pose = current_pose
+        task = state_identity["arm"][arm_index].get("task")
+        self._controller_tracking = isinstance(task, dict) and task.get("exe_flag") is True
+        self.arm_feedback_connection_generation = self.arm_connection_generation
+        # 接受时刻快照：记录本帧被接受时的 ws/state 身份与时钟；须与关节值
+        # 配对使用，改读实时值会把旧反馈绑到重连后的新连接上。
+        self.arm_feedback_ws_identity = ws_identity
+        self.arm_feedback_state_identity = state_identity
+        self.arm_feedback_accept_monotonic = time.monotonic()
+        return True
+
+    def _on_arm_connection_changed(self) -> None:
+        """连接事件：推进代次并作废映射；新连接上不能沿用旧目标。"""
+        self.arm_feedback_connection_generation = None
+        self.arm_connection_generation += 1
+        self.invalidate_pose_mapping()
+        self._last_committed_target = None
+        self._controller_tracking = False
 
     def connectArm(self, control_host) -> bool:
         """
@@ -506,10 +359,11 @@ Raises:
             # 创建 API 包装器
             if self.carm_ is None:
                 try:
+                    factory = self.carm_factory or Carm
                     if self.carm_device_index is None:
-                        self.carm_ = Carm(control_host)
+                        self.carm_ = factory(control_host)
                     else:
-                        self.carm_ = Carm(control_host, self.carm_device_index)
+                        self.carm_ = factory(control_host, self.carm_device_index)
                 except Exception as e:
                     logging.error(f"[Arm] Failed to create Carm instance: {e}")
                     self.carm_ = None
@@ -546,18 +400,17 @@ Raises:
             logging.exception("[Arm] Model discovery failed")
             raise
 
-    def prepareArm(self, control_host) -> bool:
+    def prepareArm(self) -> bool:
         """
-校验初始化配置后使能机械臂（``set_ready`` + 控制模式 4 并注册错误回调）。
-
-Args:
-    control_host: 控制端点（仅保留调用形态，本方法不再建连）。
+校验初始化配置后使能机械臂（``set_ready`` + 控制模式 2 并注册错误回调）。
 
 Returns:
     使能准备全部成功为 True；配置非法、已取消或异常时为 False。
 """
         try:
             self._active_init_joint()
+            self._active_zero_joint()
+            self._active_teleop_reset_joint()
             if self.motion_cancel_event.is_set():
                 return False
             logging.info("[Arm] Connected. Enabling servo...")
@@ -565,7 +418,7 @@ Returns:
             time.sleep(0.2)
 
             logging.info("[Arm] Setting control mode...")
-            self.carm_.set_control_mode(4)
+            self.carm_.set_control_mode(2)
             time.sleep(0.2)
 
             self.carm_.on_error(lambda msg: logging.error(f"[Arm Error] {msg}"))
@@ -578,292 +431,147 @@ Returns:
             logging.exception(e)
             return False
 
-    def moveToInitPosition(self) -> bool:
-        """触发已配置的初始化位置运动并等待名义运动窗口结束。
+    def trigger_init_motion(self) -> bool:
+        """发送初始化关节运动，不等待名义窗口。"""
+        return self._trigger_joint_motion(self._active_init_joint())
 
-        Returns:
-            bool：未连接、发送失败或异常时为 False，否则为 True（窗口结束不等于已到位）
-        """
-        if not self.carm_ or not self.carm_.is_connected():
-            logging.error("[CommandController] Arm is not connected before initialization movement")
-            return False
-
-        logging.info("[Arm] Moving to configured initialization position...")
-        try:
-            init_joint = self._active_init_joint()
-            logging.info(f"[CommandController] Sending move_joint command to position: {init_joint}")
-            if not self._trigger_joint_motion(init_joint):
-                return False
-            self._refresh_current_pose()
-            logging.info("[Arm] Initialization trigger window completed")
-            return True
-        except Exception as e:
-            logging.error(f"[CommandController] Error during initialization movement: {e}")
-            logging.exception(e)
-            return False
-
-    def _trigger_joint_motion(self, joints) -> bool:
-        """仅触发关节运动并等待名义时长窗口（防重叠，不是到位判定）。
-
-        Args:
-            joints: 目标关节值
-        Returns:
-            bool：窗口正常结束且未取消时为 True；已取消或连接断开时为 False
-        """
+    def _trigger_joint_motion(self, joints, disconnected_log_level=logging.ERROR) -> bool:
+        """取消或断连时拒绝发送，否则触发非阻塞关节运动。"""
         if self.motion_cancel_event.is_set():
             return False
-        duration = 5.0
-        self.carm_.move_joint(joints, duration, False)
-        deadline = time.monotonic() + duration
+        if not self.carm_ or not self.carm_.is_connected():
+            logging.log(
+                disconnected_log_level,
+                "[CommandController] Arm not connected before joint movement for role=%s",
+                self.arm_role,
+            )
+            return False
+        self.carm_.move_joint(joints, -1, False, 0, speed=self.move_speed)
+        self._last_committed_target = None
+        self._motion_deadline = time.monotonic() + MOVE_JOINT_WINDOW_S
+        return True
+
+    @staticmethod
+    def wait_joint_motion_window(controllers: List["CommandController"]) -> List["CommandController"]:
+        """等到最后触发的臂满一个名义窗口，返回窗口完成且已尝试刷新位姿的臂。
+
+        窗口从触发算起，调用方在触发后做的其他等待（如腰的窗口）计入其中。所有臂共用
+        Host 的取消事件；任一断连使整个窗口失败，不判断 SDK 返回或到位。位姿刷新不要求
+        新反馈到达，异常则只让对应臂失败。
+        """
+        if not controllers:
+            return []
+        cancel_event = controllers[0].motion_cancel_event
+        deadline = max(controller._motion_deadline for controller in controllers)
+
+        def any_disconnected():
+            return any(not controller.carm_.is_connected() for controller in controllers)
+
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                return not self.motion_cancel_event.is_set()
-            if self.motion_cancel_event.wait(min(0.05, remaining)):
-                return False
-            if not self.carm_.is_connected():
-                self.motion_cancel_event.set()
-                return False
+                if cancel_event.is_set():
+                    return []
+                # 窗口可能已被调用方的其他等待占满，循环体一次没跑，这里仍要确认连接。
+                if any_disconnected():
+                    cancel_event.set()
+                    return []
+                break
+            if cancel_event.wait(min(0.05, remaining)):
+                return []
+            if any_disconnected():
+                cancel_event.set()
+                return []
 
-    def _publish_new_epoch_locked(self) -> ControlEpoch:
-        """发布新的 ControlEpoch 对象（对象身份即纪元）。
-
-        即使载荷完全相同也每次新建对象，因此全部在途复核点都能靠身份比较失效。
-
-        Returns:
-            ControlEpoch：新发布的当前纪元
-        """
-        self._epoch_serial += 1
-        self.current_epoch = ControlEpoch(serial=self._epoch_serial)
-        return self.current_epoch
-
-    def publish_epoch(self) -> ControlEpoch:
-        """
-**无锁**发布新 ControlEpoch（仅限 provider gate 临界区内调用，先换纪元再清 target）。
-
-gate 内不能取 ``pose_state_lock``（会与控制线程锁序成环）；其余状态清理由随后的
-``invalidate_pose_mapping()`` 在 pose 锁内完成。
-
-Returns:
-    新发布的当前纪元。
-"""
-        self._epoch_serial += 1
-        self.current_epoch = ControlEpoch(serial=self._epoch_serial)
-        self.current_target = None
-        return self.current_epoch
-
-    def publish_target_rejection(self) -> None:
-        """
-**无锁**清空当前目标（仅限 provider gate 临界区内调用）。
-
-与 :meth:`reject_pose_target` 的区别只有不取 ``pose_state_lock``；在途 attempt
-复核条件立即失效，其余清理留给 data 阶段。
-"""
-        self.current_target = None
+        completed = []
+        for controller in controllers:
+            try:
+                controller._refresh_current_pose()
+                completed.append(controller)
+            except Exception:
+                logging.exception("[CommandController] Motion pose refresh failed for role=%s", controller.arm_role)
+        return completed
 
     def reject_pose_target(self) -> None:
-        """清空当前目标与未提交的位姿分段（不换 epoch）。"""
-        with self.pose_state_lock:
-            self.current_target = None
-            self.pending_pose_segment = None
+        """清空当前目标。"""
+        self.current_target = None
 
     def invalidate_pose_mapping(self) -> None:
-        """作废位姿映射：换 epoch、清目标、丢弃四元数连续分支并要求重新同步反馈。
+        """作废位姿映射：清目标、丢弃四元数连续分支并要求重新同步反馈。
 
-        在机械臂连接事件、配置变更与异常路径上调用，是放弃全部在途 attempt 的
-        唯一入口。
+        由控制线程在臂连接事件、配置变更、输入断续与发送失败时调用。
         """
-        with self.pose_state_lock:
-            self._publish_new_epoch_locked()
-            self.reject_pose_target()
-            self.relative_quaternion = None
-            self.need_sync_feedback = True
+        self.reject_pose_target()
+        self.mapping.reset_branch()
+        self.need_sync_feedback = True
 
-    def _reset_pose_state(self, end_vr_pose):
-        """重建已提交的输入/机械臂基线与未提交的分段状态。
-
-        以本周期输入位姿作为新的输入基线，机械臂基线取当前反馈 ``end_arm_pose``
-        的前 7 位。
+    def _reset_pose_state(self, end_vr_pose, arm_feedback_fresh) -> bool:
+        """以本周期输入位姿重建基线，输出基线按 ``select_output_baseline`` 选择。
 
         Args:
-            end_vr_pose: 本周期的输入位姿（4x4 矩阵）
-        """
-        with self.pose_state_lock:
-            self.init_end_vr_pose = end_vr_pose.copy()
-            self.init_end_arm_pose = self.end_arm_pose[:7]
-            self.reject_pose_target()
-            self.relative_quaternion = None
-
-    def _commit_dispatch_attempt_locked(self, attempt: DispatchAttempt) -> None:
-        """派发成功后在 ``pose_state_lock`` 内提交 attempt 携带的待定基线。
-
-        只有捕获时存在未提交分段（``pending_input_pose``）才推进基线，并总是把
-        该分段标记为已消费（``pending_pose_segment = None``）。
-        """
-        if attempt.pending_input_pose is not None:
-            self.init_end_vr_pose = attempt.pending_input_pose.copy()
-            self.init_end_arm_pose = attempt.pending_target_pose.copy()
-            self.relative_quaternion = None
-        self.pending_pose_segment = None
-
-    def _dispatch_attempt_matches_locked(self, attempt: DispatchAttempt) -> bool:
-        """post 复核：attempt 捕获时的全部身份是否仍然成立。
-
-        调用前必须持有 ``pose_state_lock``；按对象身份比较 target/epoch/carm，
-        并按值比较连接代次与反馈帧序号。
-
+            end_vr_pose: 本周期的输入位姿（Pose4 元组）
+            arm_feedback_fresh: 本周期是否接受了新的反馈帧
         Returns:
-            bool：全部身份仍然成立时为 True
+            已重建为 True；既没有可用目标也没有新鲜反馈为 False，调用方等下一帧
         """
-        target = self.current_target
-        # ControlEpoch 约束（见 ControlEpoch 文档）：除 current_epoch 身份外必须同时
-        # 比较 target 身份、arm_connection_generation 与连接对象身份。
-        return bool(
-            # 目标身份：attempt.target_state 的每个字段都在捕获时取自同一个
-            # TargetState，因此对象身份比较等价于旧版逐字段等值链。
-            target is attempt.target_state
-            and self.current_epoch is attempt.epoch
-            and not self.isStop
-            and self.end_effector_driver is attempt.end_effector_driver
-            # arm 连接代次与反馈帧序号是独立维度，仍按值比较。
-            and self.arm_connection_generation
-            == attempt.arm_connection_generation
-            and self.arm_feedback_state_sequence
-            == attempt.arm_feedback_state_sequence
-            and self.carm_ is attempt.carm
-            and self._arm_connected
-            and self.arm_feedback_connection_generation
-            == attempt.arm_connection_generation
-            and attempt.carm.ws is attempt.arm_ws_identity
-            and attempt.carm.state is attempt.arm_state_identity
+        self.reject_pose_target()
+        output = select_output_baseline(
+            self._last_committed_target, self._controller_tracking,
+            self.end_arm_pose if arm_feedback_fresh else None,
+        )
+        if output is None:
+            return False
+        self.mapping.rebase(end_vr_pose, output)
+        return True
+
+    @staticmethod
+    def _transform_input_pose(pose: PoseSample, calibration):
+        """把 PoseSample 投影到机械臂坐标系。"""
+        return input_pose_to_arm(
+            (pose.x, pose.y, pose.z, pose.qx, pose.qy, pose.qz, pose.qw), calibration,
         )
 
-    def _capture_dispatch_attempt_locked(self) -> Optional[DispatchAttempt]:
-        """在 ``pose_state_lock`` 内捕获一次位姿派发 attempt。
-
-        任一前置条件（未停止、目标与纪元一致、末端驱动与机械臂连接身份一致、
-        反馈代次与帧序号一致、ws/state 对象身份一致）不成立时返回 None。
-
-        Returns:
-            Optional[DispatchAttempt]：可派发的冻结事务，或 None
-        """
-        target = self.current_target
-        if (
-            self.isStop
-            or target is None
-            or target.epoch is not self.current_epoch
-            or target.end_effector_trigger is None
-            or self.end_effector_driver is None
-            or target.arm_connection_generation
-            != self.arm_connection_generation
-            or target.arm_feedback_state_sequence
-            != self.arm_feedback_state_sequence
-            or not self.carm_
-            or not self.carm_.is_connected()
-            or not self._arm_connected
-            or self.arm_feedback_connection_generation
-            != self.arm_connection_generation
-            or self.carm_.ws is not self._arm_ws_identity
-            or self.carm_.state is not self._arm_state_identity
-        ):
-            return None
-        pending = self.pending_pose_segment
-        return DispatchAttempt(
-            target_state=target,
-            epoch=target.epoch,
-            carm=self.carm_,
-            arm_ws_identity=self._arm_ws_identity,
-            arm_state_identity=self._arm_state_identity,
-            arm_connection_generation=target.arm_connection_generation,
-            arm_feedback_state_sequence=target.arm_feedback_state_sequence,
-            end_effector_driver=self.end_effector_driver,
-            hand_binding=self.hand_binding,
-            arm_role=self.arm_role,
-            pending_input_pose=(
-                pending["input_pose"].copy() if pending is not None else None
-            ),
-            pending_target_pose=(
-                pending["target_pose"].copy() if pending is not None else None
-            ),
-        )
-
-    def _transform_input_components(self, components, calibration):
-        """把 7 分量 (x,y,z,qx,qy,qz,qw) 输入位姿投影到机械臂坐标系。"""
-        end_vr_pose = np.eye(4)
-        end_vr_pose[:3, 3] = components[:3]
-        end_vr_pose[:3, :3] = R.from_quat(components[3:7]).as_matrix()
-        return project_input_to_arm(end_vr_pose, calibration)
-
-    def _transform_input_pose(self, pose: PoseSample, calibration):
-        """把 PoseSample 展开成 7 分量元组，复用 ``_transform_input_components``。"""
-        return self._transform_input_components(
-            (pose.x, pose.y, pose.z, pose.qx, pose.qy, pose.qz, pose.qw),
-            calibration,
-        )
-
-    def _apply_input_rebase_locked(
+    def _apply_input_rebase(
         self,
         raw_pose,
         calibration,
-        button_status,
+        intent,
         arm_feedback_fresh,
     ) -> bool:
         """
-在 ``pose_state_lock`` 内应用一次 Quest 输入 rebase（重建基线）。
+在控制线程内应用一次 Quest 输入 rebase（重建基线）。
 
 Args:
     raw_pose: provider 送达的 7 分量原始输入位姿。
     calibration: 输入投影标定。
-    button_status: 本周期按钮样本（用于同步 ``last_bButton``）。
+    intent: 本周期功能结果（用于同步旋转锁）。
     arm_feedback_fresh: 本周期是否接受了新的反馈帧。
 
 Returns:
-    rebase 提交成功为 True；身份漂移、转换异常或前置条件不满足为 False。
+    rebase 提交成功为 True；转换异常或前置条件不满足为 False。
 """
-        expected_ws = self._arm_ws_identity
-        expected_state = self._arm_state_identity
-        expected_arm_generation = self.arm_connection_generation
-        expected_feedback_sequence = self.arm_feedback_state_sequence
         if (
-            not arm_feedback_fresh
-            or self.isStop
+            self.isStop
             or not self.carm_
             or not self._arm_connected
-            or self.arm_feedback_connection_generation != expected_arm_generation
+            or self.arm_feedback_connection_generation != self.arm_connection_generation
             or not self.carm_.is_connected()
-            or self.carm_.ws is not expected_ws
-            or self.carm_.state is not expected_state
+            or self.carm_.ws is not self._arm_ws_identity
         ):
             self.reject_pose_target()
             return False
 
         try:
-            # raw_pose 是 provider 送达的 7 分量元组，直接构建 4x4 矩阵，
-            # 不再经过 legacy PoseData 中转。
-            end_vr_pose = self._transform_input_components(raw_pose[:7], calibration)
+            end_vr_pose = input_pose_to_arm(raw_pose[:7], calibration)
         except Exception as e:
             self.reject_pose_target()
             logging.warning("[CommandController] Quest rebase pose conversion failed: %s", e)
             return False
 
-        if (
-            self.isStop
-            or self.arm_connection_generation != expected_arm_generation
-            or self.arm_feedback_state_sequence != expected_feedback_sequence
-            or self.arm_feedback_connection_generation != expected_arm_generation
-            or not self.carm_.is_connected()
-            or self.carm_.ws is not expected_ws
-            or self.carm_.state is not expected_state
-        ):
-            self.reject_pose_target()
+        if not self._reset_pose_state(end_vr_pose, arm_feedback_fresh):
             return False
-
-        self.init_end_vr_pose = end_vr_pose.copy()
-        self.init_end_arm_pose = self.end_arm_pose[:7]
-        self.reject_pose_target()
-        self.relative_quaternion = None
         self.need_sync_feedback = False
-        self.last_bButton = bool(button_status.btn_yb)
+        self.last_bButton = intent.rotation_locked
         return True
 
     def process_input_sample(self, sample: ControlSample) -> ControlComputation:
@@ -873,110 +581,103 @@ Returns:
             sample: 控制线程冻结的本周期输入样本
         Returns:
             ControlComputation，joint_move 非 None 时表示有待派发的关节指令；
-            SDK 依赖不可用或计算异常时返回空计算结果
+            计算异常时返回空计算结果
         """
-        if not DEPENDENCIES_AVAILABLE:
-            self.reject_pose_target()
-            return ControlComputation()
-
         try:
             pose_sample = sample.pose_data
-            button_sample = sample.button_data
-
-            value_trigger = button_sample.trigger
-            value_squeeze = button_sample.grip
-            flag_squeeze = value_squeeze > 100
-            flag_aButton = button_sample.btn_xa
-            flag_bButton = button_sample.btn_yb
+            intent = sample.intent_data
+            if intent is None:
+                self.reject_pose_target()
+                return ControlComputation()
+            value_trigger = intent.end_effector
+            flag_squeeze = intent.motion_engaged
+            home_sequence = intent.home_sequence
+            flag_bButton = intent.rotation_locked
 
             end_vr_pose = self._transform_input_pose(pose_sample, sample.params.calibration)
 
             return self.compute_control(
                 end_vr_pose,
                 flag_squeeze,
-                flag_aButton,
+                home_sequence,
                 flag_bButton,
                 value_trigger,
-                sample.input_sequence,
-                sample.session_id,
                 sample.params,
-                sample.input_source,
-                sample.epoch,
                 sample.arm_connection_generation,
                 sample.arm_feedback_fresh,
                 sample.arm_feedback_state_sequence,
-                sample.source_token,
+                sample.home_identity,
             )
         except Exception as e:
             self.invalidate_pose_mapping()
+            self.discard_home_intent(sample.intent_data, sample.home_identity, "input_processing_failed")
             logging.exception(e)
             logging.error(f"[CommandController] Callback error: {e}")
             return ControlComputation()
+
+    def reset_home_baseline(self) -> None:
+        """新控制事务开始时调用：下一个样本只建立回初始位序号基线，恢复后不补发。"""
+        self._home_identity = _HOME_UNSET
+        self._home_sequence = None
+
+    def discard_home_intent(self, intent, identity, reason: str) -> None:
+        """计算前退出时消费已有功能序号；旧身份只建基线，不能产生指令。"""
+        if intent is None:
+            return
+        self._consume_home_sequence(
+            intent.home_sequence, identity, intent.motion_engaged, discard_reason=reason,
+        )
 
     def compute_control(
         self,
         end_vr_pose,
         flag_squeeze,
-        flag_aButton,
+        home_sequence,
         flag_bButton,
         value_trigger,
-        input_sequence,
-        session_id,
         params,
-        input_source,
-        expected_epoch,
         arm_connection_generation,
         arm_feedback_fresh,
         arm_feedback_state_sequence=None,
-        source_token=None,
+        home_identity=None,
     ):
-        """在 ``pose_state_lock`` 内串行化一个控制样本对可变位姿映射状态的修改。
+        """在所属控制线程内应用一个控制样本并生成待派发目标。
 
         Args:
-            end_vr_pose: 本周期的输入位姿（4x4 矩阵）
-            flag_squeeze / flag_aButton / flag_bButton: 本周期按钮状态
+            end_vr_pose: 本周期的输入位姿（Pose4 元组）
+            flag_squeeze / home_sequence / flag_bButton: 本周期功能结果（运动、回初始位序号、旋转锁）
             value_trigger: 末端触发值
-            input_sequence / session_id / params / input_source: 来源身份与参数集
-            expected_epoch: 计算时持有的纪元（身份比较，不等即放弃本周期）
+            params: 本周期冻结的映射参数
             arm_connection_generation: 计算时的臂连接代次
             arm_feedback_fresh: 本周期是否接受了新的反馈帧
             arm_feedback_state_sequence: 冻结的反馈帧序号
-            source_token: provider 决策 token
+            home_identity: 回初始位序号所属的输入身份；变化时首样本只建基线
         Returns:
             ControlComputation，joint_move 非 None 时表示有待派发的关节指令
         """
         joint_move = None
-        with self.pose_state_lock:
-            self._pending_joint_move = None
-            if (
-                self.isStop
-                or expected_epoch is not self.current_epoch
-                or arm_connection_generation != self.arm_connection_generation
-            ):
-                self.reject_pose_target()
-                return ControlComputation()
-            self._compute_control_locked(
-                end_vr_pose,
-                flag_squeeze,
-                flag_aButton,
-                flag_bButton,
-                value_trigger,
-                input_sequence,
-                session_id,
-                params,
-                input_source,
-                expected_epoch,
-                arm_connection_generation,
-                arm_feedback_fresh,
-                arm_feedback_state_sequence,
-                source_token,
+        self._pending_joint_move = None
+        if self.isStop or arm_connection_generation != self.arm_connection_generation:
+            self._consume_home_sequence(
+                home_sequence, home_identity, flag_squeeze,
+                discard_reason="control_identity_invalid_or_stopped",
             )
-            joint_move = self._pending_joint_move
-            self._pending_joint_move = None
-            # 穿透窗口复核：``publish_epoch`` 无锁，入口校验后纪元可能已被换掉；
-            # 纪元已变则本次关节指令属于旧样本，必须丢弃。
-            if joint_move is not None and expected_epoch is not self.current_epoch:
-                joint_move = None
+            self.reject_pose_target()
+            return ControlComputation()
+        home_requested = self._consume_home_sequence(home_sequence, home_identity, flag_squeeze)
+        self._compute_control(
+            end_vr_pose,
+            flag_squeeze,
+            home_requested,
+            flag_bButton,
+            value_trigger,
+            params,
+            arm_connection_generation,
+            arm_feedback_fresh,
+            arm_feedback_state_sequence,
+        )
+        joint_move = self._pending_joint_move
+        self._pending_joint_move = None
 
         return ControlComputation(joint_move=joint_move)
 
@@ -988,73 +689,93 @@ Returns:
             admit: SDK 发送前回调，返回 False 时拒绝物理发送
         Returns:
             bool：SDK 派发结果（True 表示已提交），由调用方判定提交语义
-        Raises:
-            RuntimeError: SDK 适配器缺少 generation-bound 关节派发接口
         """
-        sender = getattr(attempt.carm, "dispatch_joint_for_connection", None)
-        if not callable(sender):
-            raise RuntimeError("Carm SDK adapter lacks generation-bound joint dispatch")
-
-        return sender(
+        return attempt.carm.dispatch_joint_for_connection(
             list(attempt.joints),
             attempt.arm_ws_identity,
-            attempt.arm_state_identity,
             admit,
-            5,
+            self.move_speed,
             False,
         )
 
-    def _compute_control_locked(
+    def begin_home_motion(self, attempt: JointMoveAttempt) -> None:
+        """记录已写入连接的回位运动，之后由 ``home_motion_pending`` 判定结束。"""
+        self._home_motion = JointMotionWatch(
+            attempt.carm, attempt.carm.last_motion_task_key, attempt.joints,
+        )
+        self._home_motion_generation = attempt.arm_connection_generation
+        self._last_committed_target = None
+
+    def home_motion_pending(self, arm_feedback_fresh: bool) -> bool:
+        """回位运动是否仍在进行；未到位时告警并允许从当前位置接管。"""
+        watch = self._home_motion
+        if watch is None:
+            return False
+        if self.arm_connection_generation != self._home_motion_generation:
+            logging.warning("[Control] Home motion abandoned on connection change: role=%s", self.arm_role)
+            self._home_motion = None
+            return False
+        if not arm_feedback_fresh:
+            return True
+        carm = watch.carm
+        arrived = watch.poll(
+            time.monotonic(), carm.joint_pos, carm.joint_vel,
+            carm._arm_state.get("task", {}).get("exe_flag", False),
+        )
+        if arrived is None:
+            return True
+        self._home_motion = None
+        if arrived:
+            logging.info("[Control] Home motion finished: role=%s", self.arm_role)
+        else:
+            logging.warning(
+                "[Control] Home motion ended short of target: role=%s joints=%s target=%s",
+                self.arm_role, carm.joint_pos, watch.target,
+            )
+        return False
+
+    def _consume_home_sequence(self, sequence, identity, motion_engaged, discard_reason=None):
+        """先消费事件再判断运动，防止退出运动后补发；身份变化首样本只建基线。"""
+        changed = self._home_identity is _HOME_UNSET or self._home_identity != identity
+        requested = not changed and sequence > self._home_sequence
+        self._home_identity = identity
+        self._home_sequence = sequence
+        if discard_reason is not None:
+            if requested or (changed and sequence > 0):
+                logging.info("[Control] Dropped home intent: %s (sequence=%s)", discard_reason, sequence)
+            return False
+        if requested and motion_engaged:
+            logging.info("[Control] Dropped home intent during motion control")
+            return False
+        return requested
+
+    def _compute_control(
         self,
         end_vr_pose,
         flag_squeeze,
-        flag_aButton,
+        home_requested,
         flag_bButton,
         value_trigger,
-        input_sequence,
-        session_id,
         params,
-        input_source,
-        expected_epoch,
         arm_connection_generation,
         arm_feedback_fresh,
         arm_feedback_state_sequence,
-        source_token,
     ):
         """控制算法计算"""
-        if flag_aButton:
-            if not flag_squeeze and not self.last_aButton:
-                logging.info("[Control] Reset to home")
-                if self.carm_:
-                    # 纪元戳取入口捕获的 ``expected_epoch``（与位姿路径对齐）：
-                    # 取 current_epoch 会让旧样本指令盖上新纪元戳并穿透下发。
-                    self._pending_joint_move = JointMoveAttempt(
-                        joints=tuple(self._active_init_joint()),
-                        epoch=expected_epoch,
-                        session_id=session_id,
-                        params_epoch=params.epoch,
-                        input_source=input_source,
-                        arm_connection_generation=self.arm_connection_generation,
-                        carm=self.carm_,
-                        arm_ws_identity=self._arm_ws_identity,
-                        arm_state_identity=self._arm_state_identity,
-                    )
-                self.last_aButton = True
-                self.need_sync_feedback = True
-            else:
-                logging.debug("请松开控制按键，等待回零点完成")
-        else:
-            if self.last_aButton:
-                if arm_feedback_fresh:
-                    self._reset_pose_state(end_vr_pose)
-                else:
-                    self.invalidate_pose_mapping()
-            self.last_aButton = False
+        if home_requested:
+            logging.info("[Control] Reset to home")
+            if self.carm_:
+                self._pending_joint_move = JointMoveAttempt(
+                    joints=tuple(self._active_teleop_reset_joint()),
+                    arm_connection_generation=self.arm_connection_generation,
+                    carm=self.carm_,
+                    arm_ws_identity=self._arm_ws_identity,
+                )
+            # A 松开时不再重置；此标记保证下次运动仍必须用新鲜反馈对齐。
+            self.need_sync_feedback = True
 
         if flag_bButton != self.last_bButton:
-            if arm_feedback_fresh:
-                self._reset_pose_state(end_vr_pose)
-            else:
+            if not self._reset_pose_state(end_vr_pose, arm_feedback_fresh):
                 self.invalidate_pose_mapping()
             logging.info(
                 "[Control] Rotation %s",
@@ -1062,158 +783,81 @@ Returns:
             )
         self.last_bButton = flag_bButton
 
-        if self.init_end_arm_pose is None or self.need_sync_feedback:
-            if flag_squeeze and arm_feedback_fresh:
-                self._reset_pose_state(end_vr_pose)
+        if not self.mapping.ready or self.need_sync_feedback:
+            if flag_squeeze and self._reset_pose_state(end_vr_pose, arm_feedback_fresh):
                 self.need_sync_feedback = False
                 logging.info("[Control] Pose state initialized on squeeze button press")
                 return
-            else:
-                self.reject_pose_target()
-                return
+            self.reject_pose_target()
+            return
 
         if not flag_squeeze:
             self.reject_pose_target()
-            self.relative_quaternion = None
+            self.mapping.reset_branch()
             self.need_sync_feedback = True
             return
 
-        if self.last_bButton:
-            delta_pos = (
-                end_vr_pose[:3, 3] - self.init_end_vr_pose[:3, 3]
-            ) * params.scale
-            delta_quat = np.asarray(self.zero_quat, dtype=float)
-            relative_quaternion = None
-            segment_angle = 0.0
-            sample_is_ambiguous = False
-        else:
-            (
-                delta_pos,
-                delta_quat,
-                relative_quaternion,
-                segment_angle,
-                sample_is_ambiguous,
-            ) = _continuous_pose_diff_with_scale(
-                self.init_end_vr_pose,
-                end_vr_pose,
-                params.scale,
-                self.relative_quaternion,
-            )
-
-        if sample_is_ambiguous:
+        target_pose = self.mapping.target(end_vr_pose, params.scale, _ROTATION_SCALE, self.last_bButton)
+        if target_pose is None:
             logging.warning(
                 "[Control] Dropping ambiguous 180-degree sample or undefined 360-degree branch and rebasing"
             )
-            if arm_feedback_fresh:
-                self._reset_pose_state(end_vr_pose)
-            else:
+            if not self._reset_pose_state(end_vr_pose, arm_feedback_fresh):
                 self.invalidate_pose_mapping()
             return
 
-        self.relative_quaternion = relative_quaternion
-        target_pose = apply_pose_delta(
-            self.init_end_arm_pose,
-            delta_pos,
-            delta_quat,
-        )
         if self.end_effector_driver is None:
             raise RuntimeError("end-effector driver is not bound")
-        # 每周期一个新 TargetState 对象；其身份取代旧的 target_revision 计数。
-        self.current_target = TargetState(
-            epoch=expected_epoch,
-            pose=tuple(target_pose[:7]),
-            input_sequence=input_sequence,
-            session_id=session_id,
-            params_epoch=params.epoch,
-            input_source=input_source,
-            arm_connection_generation=arm_connection_generation,
-            arm_feedback_state_sequence=arm_feedback_state_sequence,
-            source_token=source_token,
-            end_effector_trigger=value_trigger,
-        )
-        self.pending_pose_segment = None
-        if (
-            not self.last_bButton
-            and segment_angle + _POSE_SEGMENT_ANGLE_ATOL_RAD >= _POSE_SEGMENT_ANGLE_RAD
-        ):
-            self.pending_pose_segment = {
-                "input_pose": end_vr_pose.copy(),
-                "target_pose": target_pose.copy(),
-            }
+        self.current_target = {
+            "pose": target_pose,
+            "arm_connection_generation": arm_connection_generation,
+            "arm_feedback_state_sequence": arm_feedback_state_sequence,
+            "end_effector_trigger": value_trigger,
+        }
 
-    def dispatch_pose_attempt(self, attempt: DispatchAttempt):
-        """在 Host 锁外执行一次已准入的位姿事务（SDK generation-bound 派发）。
+    def dispatch_pose(self):
+        """发送控制线程计算的目标；基线在整个握持期间固定，成功后无待提交状态。
 
-        末端触发值通过 ``send_end_effector`` 随派发一并发送；末端发送失败只记日志，
-        不升级为位姿事务失败。
-
-        Args:
-            attempt: 已准入的位姿派发事务
-        Returns:
-            bool：SDK 派发结果；适配器缺少 generation-bound 接口时返回 False
+        不要求 ``carm.state`` 仍是周期开头的反馈帧：目标只由固定基线与输入增量算出，
+        SDK 读线程在计算期间替换状态帧属正常情况，不能当作发送失败而作废映射。
         """
-        sender = getattr(attempt.carm, "dispatch_pose_for_connection", None)
-        if not callable(sender):
-            logging.error(
-                "[CommandController] Carm SDK adapter lacks generation-bound dispatch"
-            )
+        target = self.current_target
+        carm = self.carm_
+        if (
+            self.isStop or target is None or self.end_effector_driver is None
+            or carm is None or not carm.is_connected() or not self._arm_connected
+            or target["arm_connection_generation"] != self.arm_connection_generation
+            or target["arm_feedback_state_sequence"] != self.arm_feedback_state_sequence
+            or self.arm_feedback_connection_generation != self.arm_connection_generation
+            or carm.ws is not self._arm_ws_identity
+        ):
             return False
 
         def send_end_effector() -> None:
-            """Best-effort末端发送，不让末端反馈失败升级为位姿事务失败。"""
-            try:
-                accepted = attempt.end_effector_driver.set_eff(
-                    attempt.target_state.end_effector_trigger,
-                )
-            except Exception:
-                logging.exception(
-                    "[CommandController] End-effector send raised for %s",
-                    attempt.arm_role,
-                )
-                return
-            if accepted is not True:
-                logging.warning(
-                    "[CommandController] End-effector send was not accepted for %s: %r",
-                    attempt.arm_role,
-                    accepted,
-                )
+            """位姿成功后的末端发送；失败由 EndEffectorSender 记录。"""
+            self.end_effector_driver.set_eff(target["end_effector_trigger"])
 
-        return sender(
-            list(attempt.target_state.pose),
-            attempt.arm_ws_identity,
-            send_end_effector,
+        result = carm.dispatch_pose_for_connection(
+            list(target["pose"]), self._arm_ws_identity, send_end_effector,
         )
+        if result is True:
+            self._last_pose_dispatch = time.monotonic()
+            self._last_committed_target = target["pose"]
+        return result
+
+    def pose_dispatched_within(self, seconds: float) -> bool:
+        """最近 ``seconds`` 秒内是否有 track_pose 成功写入连接（无锁读，供臂型角判断跟随）。"""
+        last = self._last_pose_dispatch
+        return last is not None and time.monotonic() - last <= seconds
 
     def halt_control(self) -> None:
         """停止控制输出并清空目标，不发送任何机械臂运动命令。"""
-        with self.pose_state_lock:
-            self._publish_new_epoch_locked()
-            self.isStop = True
-            self.reject_pose_target()
-            self.relative_quaternion = None
+        self.isStop = True
+        self.reject_pose_target()
+        self.mapping.reset_branch()
 
-    def move_home(self) -> bool:
-        """手动停止遥操时移动到零点位置。
-
-        Returns:
-            bool：未连接、发送失败或异常时为 False，否则为 True（窗口结束不等于已到位）
-        """
-        try:
-            if self.carm_ and self.carm_.is_connected():
-                logging.info("[CommandController] Moving to zero position...")
-                try:
-                    if not self._trigger_joint_motion(self._active_zero_joint()):
-                        return False
-                    self._refresh_current_pose()
-                    logging.info("[CommandController] Home trigger window completed")
-                except Exception as e:
-                    logging.error(f"[CommandController] Error during stop movement: {e}")
-                    raise
-                return True
-            else:
-                logging.warning("[CommandController] Arm not connected, cannot move to zero position")
-                return False
-        except Exception as e:
-            logging.exception(e)
-            logging.error(f"[CommandController] Error moving to zero position: {e}")
-            return False
+    def trigger_home_motion(self) -> bool:
+        """发送回零关节运动，不等待名义窗口。"""
+        return self._trigger_joint_motion(
+            self._active_zero_joint(), disconnected_log_level=logging.WARNING,
+        )

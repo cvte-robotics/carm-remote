@@ -1,11 +1,13 @@
 """遥操 Host 会话状态机（joystick 全链路的核心编排层）。
 
-用户操作排他（``user_operation``）、输入源 binding 与发布、双手同批信箱、观测镜像、
-清理编排与观测快照均在本模块；锁序 ``_lifecycle_lock`` > ``_data_lock`` >
-``pose_state_lock``，``_policy_lock`` 是叶子 gate。
+用户操作排他（``user_operation``）、输入源 binding 与发布、双手同批信箱和清理编排
+在本模块；观测快照、维护操作、腰与臂型角的启用判断分别在 ``observation``、
+``maintenance``、``waist``、``arm_angle``。输入发布只更新冻结值与单调计数，控制器映射由
+所属臂的控制线程独占。生命周期锁序为 ``_lifecycle_lock`` > ``_data_lock``。
 """
 
 import asyncio
+import copy
 import logging
 import math
 import numbers
@@ -14,14 +16,10 @@ import time
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
-from typing import Any, Dict, Optional, List, Tuple
+from typing import Any, Dict, Optional, Tuple
 
-from ..runtime.config import JoystickConfigError
-from ..runtime.dependencies import (
-    ARM_SDK_AVAILABLE, CORE_DEPENDENCIES_AVAILABLE,
-    DEPENDENCIES_AVAILABLE, Carm,
-)
-from ..runtime.context import JOYSTICK_CONFIG
+from ..runtime.config import JOYSTICK_CONFIG, JoystickConfigError
+from ..runtime.dependencies import ARM_SDK_AVAILABLE
 from carm_teleop_input_contracts import (
     ConnectOutcome,
     ConnectResult,
@@ -35,7 +33,6 @@ from carm_teleop_input_contracts import (
     JointInputBatch,
     UnifiedHandSample,
 )
-from ..sources.adapters import validate_raw_input_batch
 from ..sources.registry import (
     ActiveSourceBinding,
     BindingPhase,
@@ -43,7 +40,9 @@ from ..sources.registry import (
     SourceRegistry,
     SourceScanError,
 )
-from ..core.command_controller import CommandController, ControlParams
+from ..core.command_controller import (
+    DEFAULT_MOVE_SPEED_LEVEL, MOVE_SPEED_LEVELS, CommandController, ControlParams,
+)
 from ..core.mailbox import (
     HandInputFrame,
     InputPublication,
@@ -52,28 +51,20 @@ from ..core.mailbox import (
     LatestValueCell,
     PublicationSignal,
     hand_cells,
-    reengage_payload,
 )
-from ..core.pose_math import _is_valid_joint_position, legacy_mode_to_yaw, yaw_to_legacy_mode
+from ..core.pose_math import legacy_mode_to_yaw
 from ..end_effectors import EndEffectorFactory, resolve_end_effector_factory
 from quest.module import QuestInputModule
-from ..core.models import (
-    button_to_dict,
-    pose_to_dict,
+from .arm import (
+    BaseArmSession, active_arm_profile, apply_profile_device_indexes, build_arm_bindings,
 )
-from .arm import BaseArmSession, build_arm_bindings, LOCAL_ARM_CONTROL_HOST
 from .cleanup import CleanupContext, CleanupMode, SessionCleanup
 from .state import JoystickState, SessionPhase
-from .control_transaction import _INPUT_FRESH_S
-from .observation import (
-    ObservationArm,
-    ObservationDevice,
-    ObservationHand,
-    ObservationSnapshot,
-    ObservationStatus,
-    ObservationTransport,
-    project_http_status,
-)
+from .waist import create_waist_runtime
+from ..runtime.carm_link import CarmLinkRegistry
+from .arm_angle import arm_angle_state, create_arm_angle_runtimes
+from .maintenance import ArmMaintenance
+from .observation import ObservationSnapshot, build_observation_snapshot, project_http_status
 
 
 _CLEANUP_THREAD_TIMEOUT = 2.0
@@ -81,13 +72,6 @@ _WORKER_CHECK_INTERVAL = 1.0
 # 自动重试上界：仅限制"失败后是否再次入队"，不限制单次外部拆卸调用的退出时间。
 _AUTO_RETRY_WINDOW_S = 10.0
 _CLEANUP_WORKER_NAME = "JoystickCleanupWorker"
-
-
-def _active_arm_profile(owner):
-    """当前激活 provider 的 arm_profile（无激活模块时为 ``None``）。"""
-    registry = getattr(owner, "source_registry", None)
-    module = None if registry is None else registry.active_module()
-    return None if module is None else getattr(module, "arm_profile", None)
 
 
 @dataclass(frozen=True)
@@ -108,6 +92,9 @@ class JoystickController:
     对外提供用户操作、provider 发布入口、观测与旧版单机接口。
     """
 
+    # Board 组合注入的 Quest 直连管理器；Desktop 不启用。
+    direct_manager = None
+
     def __init__(
         self,
         scale=0.4,
@@ -125,17 +112,13 @@ class JoystickController:
             arm_binding_builder: 会话到臂绑定的构造器（测试可注入）
             end_effector_factory: 末端执行器工厂，缺省由变体解析
         """
-        if not DEPENDENCIES_AVAILABLE:
-            logging.warning("[JoystickController] Dependencies not available")
-            self.available = False
-            return
-
         self.available = True
         self.scale = scale
+        self.move_speed_level = DEFAULT_MOVE_SPEED_LEVEL
         self.joystick_config = joystick_config_snapshot or JOYSTICK_CONFIG
+        self._carm_links = CarmLinkRegistry()
 
         self.controller = None
-        self.init_position_controller = None
         self.session = None
         self._cleanup_home_allowed = False
         self.active_input_source = None
@@ -154,18 +137,15 @@ class JoystickController:
 
         self._lifecycle_lock = threading.RLock()
         self._data_lock = threading.RLock()
-        # policy gate 叶子锁：持有期间禁止获取任何其他锁（含 _data_lock）。唯一
-        # 豁免：gate 块内可经 ``module.callback_matches`` 取模块 lifecycle_lock。
-        # 前提：任何模块不得在持有自身 lifecycle_lock 时回调 Host。
-        self._policy_lock = threading.RLock()
         # 双手 publication 单槽信箱：一次批次只 store 一次，读者一次 load 即得双手同批。
+        self._discontinuity_seq = {HAND_LEFT: 0, HAND_RIGHT: 0}
+        self._input_transport_generations = {}
+        self._input_sequences = {HAND_LEFT: 0, HAND_RIGHT: 0}
         self._input_publication = LatestValueCell()
         self._joint_publication = LatestValueCell()
-        # 观测镜像：只在 ``_data_lock`` 临界区内写、在 ``get_observation_snapshot``
-        # 的 data 锁内读；任一 ``data_sequence`` 取值只映射一份观测内容。
-        self._observed_input_publication = LatestValueCell()
-        self._observed_joint_publication = LatestValueCell()
-        # 发布唤醒信号：输入/关节帧 store 之后（gate 外）notify，按输入节拍运行的
+        # 输入线程单独推进；与会话序号相加供 HTTP/SSE 检测变化。
+        self._input_publication_sequence = 0
+        # 发布唤醒信号：输入/关节帧 store 之后（data 锁外）notify，按输入节拍运行的
         # 控制线程据此在新帧到达时立即醒来；只是唤醒提示，不携带数据。
         self._publication_signal = PublicationSignal()
         # ``_reengage_cells`` 保持每手：写者是各自臂的控制线程，没有批次语义。
@@ -180,14 +160,14 @@ class JoystickController:
             calibration=self.state.calibration,
         )
 
-        # 兼容旧接口：进程内确认值在后续机械臂初始化时覆盖配置值。
-        self.cached_init_positions: Dict[str, List[float]] = {}
+        self.maintenance = ArmMaintenance(self)
 
         # 单线程清理模式：使用常驻线程处理所有清理请求
         self._cleanup_event = threading.Event()  # 触发清理的事件
         self._cleanup_thread = None  # 常驻清理线程
         self._cleanup_shutdown = False  # 标记是否正在关闭
         self._pending_cleanup_request: Optional[StopRequest] = None
+        self._source_reconnect_deadline: Optional[Tuple[SourceLease, float]] = None
         self._session_cleanup = SessionCleanup(self)
 
         # 启动清理线程
@@ -287,16 +267,18 @@ class JoystickController:
         return True
 
     def _reset_source_policies(self) -> None:
-        """把所有 provider 的 policy 状态归零（在 gate 内）。"""
+        """向 provider 发布输入检测重置请求（不改写输入线程的比较状态）。"""
         for provider_id in self.source_registry.provider_ids:
             module = self.source_registry.existing(provider_id)
             if module is not None:
-                # policy 状态与 provider 发布路径共用同一个叶子 gate。
-                with self._policy_lock:
-                    self._call_optional_interface(module, "reset_policy")
+                self._call_optional_interface(module, "reset_policy")
 
-    def _is_hand_bound_active_locked(self, hand: str, controller=None) -> bool:
-        """某只手是否被已连接的 arm runtime 绑定为当前控制手（可按 controller 限定）。"""
+    def _is_hand_bound_active(self, hand: str, controller=None) -> bool:
+        """某只手是否被已连接的 arm runtime 绑定为当前控制手（可按 controller 限定）。
+
+        可在锁外调用：``arm_states`` 外层键固定、重置时整体替换，内层只改已有键的值，
+        遍历不会因并发写入出错；瞬时不一致只影响输入侧的绑定标志，不影响控制安全。
+        """
         for arm_state in self.state.arm_states.values():
             if (
                 arm_state.get("connected")
@@ -314,96 +296,49 @@ class JoystickController:
         return False
 
     def _clear_input_cells(self) -> None:
-        """清空双手 publication、观测镜像与每手 reengage 信箱（须在 data 锁内与序号同临界区）。"""
+        """在 data 锁内随会话状态清空双手 publication 与每手 reengage 信箱。"""
         self._input_publication.clear()
         self._joint_publication.clear()
-        self._observed_input_publication.clear()
-        self._observed_joint_publication.clear()
         for hand in (HAND_LEFT, HAND_RIGHT):
             self._reengage_cells[hand].clear()
 
-    def _withdraw_published_frames(self, publication, joint: bool = False) -> None:
-        """撤销一次已提交但随即失效的双手发布（仅当槽位仍是本次 publication）。
-
-        观测镜像不参与撤销：被撤销的 publication 从未进入镜像。
-        """
-        cell = self._joint_publication if joint else self._input_publication
-        if cell.load() is publication:
-            cell.clear()
-
-    def _clear_input_display_cells(self) -> None:
-        """
-        非终止断开：只清位姿/按钮显示槽位，保留"可用于控制的数据"。
-
-        读—改—写须在 ``_policy_lock`` 内完成，避免覆盖发布线程新存的 publication；
-        观测镜像的显示清空在 data 锁内对已提交内容完成。
-        """
-        with self._policy_lock:
-            publication = self._input_publication.load()
-            if publication is not None:
-                cleared = publication.without_display()
-                if cleared is not publication:
-                    self._input_publication.store(cleared)
-        observed = self._observed_input_publication.load()
-        if observed is not None:
-            self._observed_input_publication.store(observed.without_display())
+    def _hand_control_running(self, hand: str) -> bool:
+        """绑定变更前检查该手的控制线程是否已退出。"""
+        return bool(self.session and any(
+            runtime.hand == hand
+            and getattr(runtime, "thread", None) is not None
+            and runtime.thread.is_alive()
+            for runtime in self.session.arms
+        ))
 
     def publish_source_controller(self, controller: CommandController) -> bool:
-        """把 controller 绑定到当前输入源 binding（controller 绑定族）。
-
-        Returns:
-            bool：无有效 binding/模块（无需绑定）返回 True；输入未连接返回 False；
-            其余情况完成绑定后返回 True
-        """
+        """仅在该手控制线程停止后发布绑定；新控制事务自行同步反馈。"""
         with self._data_lock:
             module = self.source_registry.active_module()
             binding = self.active_source_binding
             if module is None or binding is None or binding.phase is BindingPhase.CLOSED:
                 return True
-            if not self.state.ble_connected:
+            if not self.state.ble_connected or self._hand_control_running(controller.hand_binding):
                 return False
-            # controller 绑定族是可选接口：仅位姿/重连宽限模块参与，
-            # Host 自身的会话身份与状态推进不受模块是否实现影响。
-            previous_controller = None
             if self._optional_interface_enabled(binding.capabilities):
-                # policy 状态（controller 绑定、pin、token）只经 gate 变更。
-                with self._policy_lock:
-                    previous_controller = module.bind_controller(
-                        controller.hand_binding,
-                        controller,
-                        binding.session_id,
-                        self._control_params.epoch,
-                    )
+                module.bind_controller(controller.hand_binding, controller)
             self.state.data_sequence += 1
-            if previous_controller is not None and previous_controller is not controller:
-                previous_controller.invalidate_pose_mapping()
             return True
 
     def release_source_controller(self, controller: CommandController) -> None:
-        """解除 controller 绑定；释放成功（或最小契约模块路径）都会失效位姿映射。"""
+        """仅在该手控制线程停止后解除绑定，不改写映射。"""
         with self._data_lock:
+            if self._hand_control_running(controller.hand_binding):
+                raise RuntimeError("control thread must be joined before binding change")
             module = self.source_registry.active_module()
             if module is None:
                 return
             binding = self.active_source_binding
             capabilities = binding.capabilities if binding is not None else None
-            if not self._optional_interface_enabled(capabilities):
-                # 最小契约模块不参与 controller 绑定族；Host 仍失效映射。
-                self.state.data_sequence += 1
-                controller.invalidate_pose_mapping()
-                return
-            with self._policy_lock:
-                released = bool(
-                    module.release_controller(
-                        controller.hand_binding,
-                        controller,
-                        self._control_params.epoch,
-                    )
-                )
-            if not released:
-                return
+            if self._optional_interface_enabled(capabilities):
+                if not module.release_controller(controller.hand_binding, controller):
+                    return
             self.state.data_sequence += 1
-            controller.invalidate_pose_mapping()
 
     def connection_is_current(
         self,
@@ -430,62 +365,80 @@ class JoystickController:
         """provider 原始输入批次的发布入口（转交 ``_handle_input_batch``）。"""
         self._handle_input_batch(batch, provider_identity)
 
+    def _input_state_needs_update(self, binding, joint=False) -> bool:
+        """无锁预检；稳定帧只发布输入，不反复写相同的会话状态。"""
+        return bool(
+            binding.phase is BindingPhase.PROVISIONAL or not binding.input_ready
+            or not self.state.ble_connected
+            or (joint and self.state.transport_state != "ready")
+            or (not joint and (
+                self.state.phase not in {
+                    SessionPhase.CONNECTED, SessionPhase.INITIALIZING, SessionPhase.READY,
+                }
+                or self.state.last_error is not None
+                or self.state.transport_terminal
+                or self.state.source_type != binding.public_source_type
+                or self.state.is_quest_device != bool(binding.capabilities.supports_reconnect_grace)
+            ))
+        )
+
+    def _accept_input_state(self, binding, joint=False) -> None:
+        """只在就绪状态改变时持 data 锁，并复核该帧仍属于当前 lease。"""
+        if not self._input_state_needs_update(binding, joint):
+            return
+        with self._data_lock:
+            current = self.active_source_binding
+            if (current is None or current.phase is BindingPhase.CLOSED
+                    or current.lease != binding.lease
+                    or not self._input_state_needs_update(current, joint)):
+                return
+            self._activate_binding_locked(current.lease.provider_id, current.lease.input_generation)
+            self.state.ble_connected = True
+            if joint:
+                self.state.transport_state = "ready"
+            else:
+                if self.state.phase not in {SessionPhase.INITIALIZING, SessionPhase.READY}:
+                    self._set_phase_locked(SessionPhase.CONNECTED)
+                self.state.last_error = None
+                self.state.transport_terminal = False
+                self.state.source_type = current.public_source_type
+                self.state.is_quest_device = bool(current.capabilities.supports_reconnect_grace)
+            self.state.data_sequence += 1
+
     def publish_joint_input(self, batch, provider_identity) -> None:
-        """发布一只手的关节目标帧，提交规则同 ``publish_input``（gate 内冻结、data 锁内激活与推序号）。
+        """输入线程按 lease 校验并一次发布关节双手快照。
 
         Raises:
             TypeError: 传入的不是 ``JointInputBatch``
         """
         if not isinstance(batch, JointInputBatch):
             raise TypeError("expected JointInputBatch")
-        # 提交规则（1.1）：policy 视角（此处为 provider stub）与冻结帧的发布在同一
-        # 个 gate 临界区内推进；gate 是叶子锁，持有期间不取任何其他锁。
-        with self._policy_lock:
-            binding = self.active_source_binding
-            module = self.source_registry.active_module()
-            if (binding is None or module is None or binding.phase is BindingPhase.CLOSED
-                    or binding.lease != batch.lease
-                    or not binding.capabilities.provides_joint_targets
-                    or not module.callback_matches(batch.lease, provider_identity)):
-                return
-            received = time.monotonic()
-            # 双手在**同一个** publication 里一次落地：读者一次 load 即得双手同批。
-            publication = JointPublication(
-                left=JointInputFrame(
-                    lease=batch.lease,
-                    batch_sequence=batch.batch_sequence,
-                    target=batch.left,
-                    received_monotonic=received,
-                ),
-                right=JointInputFrame(
-                    lease=batch.lease,
-                    batch_sequence=batch.batch_sequence,
-                    target=batch.right,
-                    received_monotonic=received,
-                ),
-                batch_sequence=batch.batch_sequence,
-                lease=batch.lease,
+        binding = self.active_source_binding
+        if (binding is None or binding.phase is BindingPhase.CLOSED
+                or binding.lease != batch.lease
+                or not binding.capabilities.provides_joint_targets):
+            return
+        resuming = not self.state.ble_connected
+        self._accept_input_state(binding, joint=True)
+        received = time.monotonic()
+        frames = {}
+        for hand, target in ((HAND_LEFT, batch.left), (HAND_RIGHT, batch.right)):
+            generation = (batch.lease, batch.transport_generation)
+            previous_generation = self._input_transport_generations.get(hand)
+            if resuming or (previous_generation is not None and previous_generation != generation):
+                self._discontinuity_seq[hand] += 1
+            self._input_transport_generations[hand] = generation
+            frames[hand] = JointInputFrame(
+                lease=batch.lease, batch_sequence=batch.batch_sequence,
+                target=target, received_monotonic=received,
+                discontinuity_seq=self._discontinuity_seq[hand],
             )
-            self._joint_publication.store(publication)
-        # gate 外唤醒控制线程（信号锁是叶子锁，不得在 gate 内获取）。
+        self._joint_publication.store(JointPublication(
+            left=frames[HAND_LEFT], right=frames[HAND_RIGHT],
+            batch_sequence=batch.batch_sequence, lease=batch.lease,
+        ))
+        self._input_publication_sequence += 1
         self._publication_signal.notify()
-        # 先 store 后 bump：SSE 以 data_sequence 做变更检测，必须在帧可见后推进。
-        with self._data_lock:
-            binding = self.active_source_binding
-            module = self.source_registry.active_module()
-            if (binding is None or module is None or binding.phase is BindingPhase.CLOSED
-                    or binding.lease != batch.lease):
-                # 提交点之后会话才失效：撤销本次发布（写入即失效）。
-                self._withdraw_published_frames(publication, joint=True)
-                return
-            if binding.phase is BindingPhase.PROVISIONAL:
-                self._activate_binding_locked(batch.lease.provider_id, batch.lease.input_generation)
-            self.state.ble_connected = True
-            self.state.transport_state = "ready"
-            # 成对提交：本次冻结帧在此与序号一起对观测可见（gate 预提交只对控制路径
-            # 即时可见，见 get_observation_snapshot 的观测镜像说明）。
-            self._observed_joint_publication.store(publication)
-            self.state.data_sequence += 1
 
     def publish_telemetry(
         self,
@@ -520,15 +473,13 @@ class JoystickController:
     ) -> None:
         """发布传输事件（ready/disconnected/terminal）并编排后续清理或重连宽限。
 
-        非终止断开只做"暂停"：binding 未关闭、会话身份不变，控制失效由暂停
-        controller 的纪元发布承担；终止断开与重连宽限到期才进入
+        非终止断开只做暂停：binding 未关闭、会话身份不变，清空输入信箱；
+        终止断开与重连宽限到期才进入
         ``_mark_disconnected_and_request_cleanup``。
         """
         if not self.connection_is_current(event.lease, provider_identity):
             return
         schedule_terminal_cleanup = False
-        schedule_reconnect = False
-        suspended_controllers = set()
         with self._data_lock:
             binding = self.active_source_binding
             module = self.source_registry.active_module()
@@ -559,15 +510,17 @@ class JoystickController:
                     event.lease.input_generation,
                     False,
                 )
-                if not event.terminal:
-                    # 非终止断开：仍属同一会话（binding 未关闭），因此没有任何
-                    # 会话身份变化；控制失效由暂停控制器的纪元发布承担。
-                    suspended_controllers.update(self._active_pose_controllers())
-                    if self._optional_interface_enabled(binding.capabilities):
-                        with self._policy_lock:
-                            suspended_controllers.update(module.mark_input_disconnected())
+                if self._optional_interface_enabled(binding.capabilities):
+                    module.mark_input_disconnected()
+            if (event.phase in {"disconnected", "terminal"}
+                    or (event.phase == "ready"
+                        and event.transport_generation != self.state.quest_transport_generation)):
+                self._input_publication.clear()
+                self._joint_publication.clear()
             self.state.transport_state = event.phase
             self.state.transport_terminal = event.terminal
+            if event.terminal:
+                self._source_reconnect_deadline = None
             self.state.quest_protocol_version = details.get("protocol_version")
             self.state.quest_connection_id = details.get("connection_id")
             self.state.quest_last_rx_monotonic = details.get("last_rx_monotonic")
@@ -588,27 +541,23 @@ class JoystickController:
             elif event.phase in {"disconnected", "terminal"}:
                 self.state.ble_connected = False
                 if not event.terminal:
-                    self._clear_input_display_cells()
                     self.state.device_status = {}
                 else:
                     self.state.last_error = event.reason
             self.state.data_sequence += 1
             schedule_terminal_cleanup = bool(event.terminal and was_open)
-            schedule_reconnect = bool(
+            if (
                 not event.terminal
                 and event.phase == "disconnected"
                 and binding.capabilities.supports_reconnect_grace
                 and was_active
-            )
-        for controller in suspended_controllers:
-            controller.invalidate_pose_mapping()
+            ):
+                self._start_source_reconnect_grace_locked(event.lease, module)
         if schedule_terminal_cleanup:
             self._mark_disconnected_and_request_cleanup(
                 event.reason or "input-transport-terminal",
                 expected_lease=event.lease,
             )
-        elif schedule_reconnect:
-            self._schedule_source_reconnect_cleanup(event.lease)
 
     def _binding_matches_locked(
         self,
@@ -659,6 +608,7 @@ class JoystickController:
 
     def _close_binding_locked(self) -> None:
         """关闭当前 binding（经 registry ``begin_close``），保留已关闭的 binding 对象。"""
+        self._source_reconnect_deadline = None
         binding = self.active_source_binding
         if binding is not None and binding.phase is not BindingPhase.CLOSED:
             self.source_registry.begin_close(binding.lease)
@@ -690,12 +640,10 @@ class JoystickController:
             capabilities = module.availability().capabilities
         if public_source_type is None:
             public_source_type = source
+        if self.session and any(self._hand_control_running(hand) for hand in (HAND_LEFT, HAND_RIGHT)):
+            raise RuntimeError("control threads must be joined before source activation")
         if module.current_lease() is not None:
             raise RuntimeError("previous input transport must be closed before activation")
-        self._call_optional_interface(
-            module, "cancel_reconnect_timer", clear_deadline=True,
-            capabilities=capabilities,
-        )
         with self._data_lock:
             session_id = self._session_sequence + 1
             lease = self.source_registry.allocate_lease(
@@ -718,103 +666,45 @@ class JoystickController:
             )
             self._reset_source_policies()
             self.state.data_sequence += 1
-            for controller in self._active_pose_controllers():
-                controller.invalidate_pose_mapping()
             return session_id
 
-    def _active_pose_controllers(self) -> List[CommandController]:
-        """当前参与位姿映射的 controller 集合（arm 会话优先，否则单体 controller）。"""
-        if self.session:
-            return [runtime.controller for runtime in self.session.arms]
-        return [self.controller] if self.controller else []
-
-    def _request_source_mapping_change_locked(self, reason: str):
-        """把映射变化通知给 provider（最小契约模块返回空元组）；在 gate 内计算活跃手。"""
-        module = self.source_registry.active_module()
-        if module is None:
-            return ()
-        binding = self.active_source_binding
-        capabilities = binding.capabilities if binding is not None else None
-        if not self._optional_interface_enabled(capabilities):
-            # 最小契约模块不参与 controller 绑定族与映射通知。
-            return ()
-        with self._policy_lock:
-            active_hands = tuple(
-                hand
-                for hand in (HAND_LEFT, HAND_RIGHT)
-                if (
-                    (controller := module.controller_for_hand(hand)) is not None
-                    and self._is_hand_bound_active_locked(hand, controller)
-                )
+    def _start_source_reconnect_grace_locked(self, lease: SourceLease, module) -> None:
+        """首次非终止断开时记录宽限截止时间；中途恢复不重置。"""
+        if self._source_reconnect_deadline is None:
+            self._source_reconnect_deadline = (
+                lease, time.monotonic() + module.reconnect_grace_seconds,
             )
-            return module.on_mapping_change(
-                reason,
-                active_hands,
-                self.active_source_binding.session_id,
-                self._control_params.epoch,
-            )
+            self._cleanup_event.set()
 
-    def _schedule_source_reconnect_cleanup(self, lease: SourceLease) -> None:
-        """启动 provider 重连宽限：注入恢复判定回调与到期回调。"""
-        module = self.source_registry.active_module()
-        if module is None:
+    def _handle_source_reconnect_deadline_locked(self) -> None:
+        """清理线程在取请求前复核到期宽限；只持有 data 锁。"""
+        pending = self._source_reconnect_deadline
+        if pending is None or time.monotonic() < pending[1]:
             return
-
-        def evaluate_recovery() -> Tuple[bool, bool]:
-            """宽限到期时判定：会话是否已过期、传输是否已自愈。"""
-            with self._data_lock:
-                binding = self.active_source_binding
-                stale_session = bool(
-                    binding is None
-                    or binding.phase is BindingPhase.CLOSED
-                    or binding.lease != lease
-                )
-                transport_recovered = self.state.transport_state in {
-                    "healthy",
-                    "ready",
-                }
-            return stale_session, transport_recovered
-
-        module.begin_reconnect_grace(
-            lease,
-            evaluate_recovery,
-            lambda _input_generation: self._expire_source_reconnect_deadline(
-                lease,
-            ),
-        )
+        lease, _ = pending
+        self._source_reconnect_deadline = None
+        binding = self.active_source_binding
+        if (binding is None or binding.phase is BindingPhase.CLOSED
+                or binding.lease != lease):
+            return
+        if self.state.transport_state in {"healthy", "ready"}:
+            return
+        self._expire_source_reconnect_deadline(lease)
 
     def _expire_source_reconnect_deadline(
         self,
         lease: SourceLease,
     ) -> None:
-        """重连宽限到期：先失效输入，再按当前会话世代请求清理。"""
-        result = self._mark_input_disconnected(
+        """持 data 锁且已复核当前 lease：失效输入并按新会话序号请求清理。"""
+        self._mark_input_disconnected(
             "input-reconnect-deadline",
             expected_lease=lease,
         )
-        if result is None:
-            return
-        with self._data_lock:
-            cleanup_session_id = self._session_sequence
-        # 已有 worker 会阻塞等待 lifecycle 所有权，直到在飞的初始化返回；
-        # 因此这里不需要轮询定时器。
         self.request_stop_session(
             reason="input-reconnect-deadline",
-            expected_session_id=cleanup_session_id,
+            expected_session_id=self._session_sequence,
             expected_lease=lease,
         )
-
-    def _cancel_source_reconnect_timers(
-        self,
-        clear_deadline: bool = False,
-    ) -> None:
-        """取消所有 provider 的重连定时器（可选一并清掉 deadline）。"""
-        for provider_id in self.source_registry.provider_ids:
-            module = self.source_registry.existing(provider_id)
-            if module is not None:
-                self._call_optional_interface(
-                    module, "cancel_reconnect_timer", clear_deadline=clear_deadline,
-                )
 
     def _mark_input_disconnected(
         self,
@@ -839,15 +729,6 @@ class JoystickController:
             ):
                 return None
             self._motion_cancel.set()
-            module = self.source_registry.active_module()
-            controllers = set(self._active_pose_controllers())
-            owned = ()
-            if module is not None and self._optional_interface_enabled(
-                binding.capabilities if binding is not None else None
-            ):
-                with self._policy_lock:
-                    owned = module.owned_controllers() or ()
-            controllers.update(owned)
             input_was_open = bool(
                 self.active_input_source is not None
                 or self.state.ble_connected
@@ -876,10 +757,7 @@ class JoystickController:
                 self._set_phase_locked(SessionPhase.STOPPING)
             self.state.data_sequence += 1
 
-        self._reset_source_policies()
-        for controller in controllers:
-            controller.invalidate_pose_mapping()
-        self._cancel_source_reconnect_timers(clear_deadline=True)
+            self._reset_source_policies()
         return is_initializing
 
     def _mark_disconnected_and_request_cleanup(
@@ -977,6 +855,12 @@ class JoystickController:
             )
             self.state.data_sequence += 1
 
+    def set_direct_state(self, payload: dict) -> None:
+        """发布直连管理器给出的直连状态，并推进观测序列。"""
+        with self._data_lock:
+            self.state.direct = copy.deepcopy(payload)
+            self.state.data_sequence += 1
+
     def _build_command_controller(self, role: str, hand_binding: str):
         """按 role/hand_binding 构造 CommandController 并挂上运动取消事件。"""
         # 控制器对象本身就是凭据：一个 arm runtime 的控制器每会话只发布一次，
@@ -985,10 +869,25 @@ class JoystickController:
             self.scale, hand_binding=hand_binding, arm_role=role,
         )
         controller.motion_cancel_event = self._motion_cancel
+        controller.move_speed = MOVE_SPEED_LEVELS[self.move_speed_level]
+        links = self._shared_carm_links()
+        if links is not None:
+            controller.carm_factory = links.channel
         return controller
 
+    def _shared_carm_links(self):
+        """``sdk.shared_connection`` 启用且 SDK 可用时返回共享连接注册表，否则为 None。
+
+        同一 control_host 上的臂与腰共用一条 SDK 连接；A3 异板双臂每板各一条。
+        """
+        if not ARM_SDK_AVAILABLE or not self.joystick_config.resolve_shared_connection():
+            return None
+        return self._carm_links
+
     def configure_arm_initialization(self, runtime):
-        """按当前输入源的 arm profile 固化 runtime 的初始化关节。
+        """按当前输入源的 arm profile 固化 runtime 的初始化、回零与遥操回初始位关节。
+
+        Web 确认过初始化位置时，确认值同时用作遥操回初始位目标（优先于配置）。
 
         Raises:
             ValueError: 型号不在 profile 允许集内
@@ -996,7 +895,7 @@ class JoystickController:
         """
         controller = runtime.controller
         model = controller.arm_model
-        profile = _active_arm_profile(self)
+        profile = active_arm_profile(self)
         if profile is not None and profile.models and model not in profile.models and not any(
             model.startswith(name) for name in profile.models
         ):
@@ -1007,9 +906,55 @@ class JoystickController:
                 raise ValueError("当前输入源关节自由度与机械臂型号不匹配")
         config = self.joystick_config.resolve_arm(model, self.state.mode, runtime.hand)
         controller.init_joint_ = list(config.init_joint)
-        if self.state.mode == "single":
-            controller.load_cached_init_position(self.get_cached_init_position(model))
+        controller.home_joint_ = list(config.home_joint)
+        controller.teleop_reset_joint_ = list(config.teleop_reset_joint)
+        if controller.load_cached_init_position(
+            self.get_cached_init_position(model, self.state.mode, runtime.hand)
+        ):
+            controller.teleop_reset_joint_ = list(controller.init_joint_)
         controller._active_init_joint()
+
+    def _set_waist_state(self, status, following=False, mode=None, error=None):
+        """发布腰状态投影（HTTP/SSE），并推进数据序列。"""
+        value = {"status": status, "following": bool(following), "mode": mode,
+                 "error": error}
+        with self._data_lock:
+            if self.state.waist == value:
+                return
+            self.state.waist = value
+            self.state.data_sequence += 1
+            module = self.source_registry.active_module()
+        # 模块持有自己的生命周期锁；不得在 Host 数据锁内调用。
+        if isinstance(module, QuestInputModule):
+            module.set_waist_state(status, following, mode, error)
+
+    def _set_arm_angle_state(self, side, value):
+        """更新单臂臂型角状态并把双臂快照同步给 Quest（Web 观测不含臂型角）。"""
+        with self._data_lock:
+            current = dict(self.state.arm_angle or {})
+            if current.get(side) == value:
+                return
+            current[side] = dict(value)
+            current.setdefault("left", arm_angle_state("unavailable"))
+            current.setdefault("right", arm_angle_state("unavailable"))
+            self.state.arm_angle = current
+            module = self.source_registry.active_module()
+        if isinstance(module, QuestInputModule):
+            module.set_arm_angle_state(current["left"], current["right"])
+
+    def _set_arm_angle_unavailable(self, status):
+        """同时设置左右臂型角的准入/禁用状态。"""
+        value = arm_angle_state(status)
+        self._set_arm_angle_state("left", value)
+        self._set_arm_angle_state("right", value)
+
+    def _create_waist_runtime(self, runtimes):
+        """决定是否启用腰控制，见 ``create_waist_runtime``。"""
+        return create_waist_runtime(self, runtimes)
+
+    def _create_arm_angle_runtimes(self, runtimes):
+        """决定是否启用臂型角，见 ``create_arm_angle_runtimes``。"""
+        return create_arm_angle_runtimes(self, runtimes)
 
     def _start_cleanup_thread(self):
         """启动常驻清理线程"""
@@ -1058,80 +1003,66 @@ class JoystickController:
         """单常驻线程消费与会话世代绑定的停止请求（generation-bound）。"""
         while True:
             try:
-                triggered = self._cleanup_event.wait(
-                    timeout=_WORKER_CHECK_INTERVAL
-                )
-                if not triggered:
+                with self._data_lock:
+                    if self._cleanup_shutdown:
+                        logging.info("[CleanupWorker] Cleanup worker thread shutting down")
+                        return
+                    self._handle_source_reconnect_deadline_locked()
+                    request = self._pending_cleanup_request
+                    self._pending_cleanup_request = None
+                    timeout = _WORKER_CHECK_INTERVAL
+                    if self._source_reconnect_deadline is not None:
+                        timeout = min(timeout, max(
+                            0.0, self._source_reconnect_deadline[1] - time.monotonic(),
+                        ))
+                if request is None:
+                    self._cleanup_event.wait(timeout=timeout)
+                    self._cleanup_event.clear()
                     continue
-                self._cleanup_event.clear()
 
-                while True:
-                    with self._data_lock:
-                        if self._cleanup_shutdown:
-                            logging.info(
-                                "[CleanupWorker] Cleanup worker thread shutting down"
+                try:
+                    with self._lifecycle_lock:
+                        with self._data_lock:
+                            cleanup_lease = self.source_registry.cleanup_lease()
+                            stale = bool(
+                                self._session_sequence != request.session_id
+                                or self.active_input_source is not None
+                                or (
+                                    # provider 已释放时仍需重试 Arm；仅新 lease 接管才过期。
+                                    request.lease is not None
+                                    and cleanup_lease is not None
+                                    and cleanup_lease != request.lease
+                                )
                             )
-                            return
-                        request = self._pending_cleanup_request
-                        self._pending_cleanup_request = None
-                        if request is None:
-                            break
-
-                    try:
-                        with self._lifecycle_lock:
-                            with self._data_lock:
-                                cleanup_lease = self.source_registry.cleanup_lease()
-                                stale = bool(
-                                    self._session_sequence
-                                    != request.session_id
-                                    or self.active_input_source is not None
-                                    or (
-                                        # 只有"已被另一个 lease 接管"才算 stale；
-                                        # provider 步已释放时仍需重试未完成的 Arm 步。
-                                        request.lease is not None
-                                        and cleanup_lease is not None
-                                        and cleanup_lease != request.lease
-                                    )
-                                )
-                            if stale:
-                                logging.info(
-                                    "[CleanupWorker] Skipping stale cleanup, reason=%s",
-                                    request.reason,
-                                )
-                                continue
+                        if stale:
                             logging.info(
-                                "[CleanupWorker] Starting hold cleanup, reason=%s",
+                                "[CleanupWorker] Skipping stale cleanup, reason=%s",
                                 request.reason,
                             )
-                            context = self._build_cleanup_context_locked(
-                                CleanupMode.HOLD,
-                                request.reason,
-                            )
-                            result = self._run_cleanup_locked(context)
-                            if not result.success:
-                                if self._requeue_failed_stop_request(request):
-                                    time.sleep(_WORKER_CHECK_INTERVAL)
-                                    self._cleanup_event.set()
-                                    break
-                                continue
-                            logging.info(
-                                "[CleanupWorker] Cleanup operation completed"
-                            )
-                    except Exception:
-                        logging.exception(
-                            "[CleanupWorker] Cleanup operation failed"
+                            continue
+                        logging.info(
+                            "[CleanupWorker] Starting hold cleanup, reason=%s",
+                            request.reason,
                         )
-                        if self._requeue_failed_stop_request(request):
-                            time.sleep(_WORKER_CHECK_INTERVAL)
-                            self._cleanup_event.set()
-                            break
+                        context = self._build_cleanup_context_locked(
+                            CleanupMode.HOLD, request.reason,
+                        )
+                        result = self._run_cleanup_locked(context)
+                        if not result.success:
+                            if self._requeue_failed_stop_request(request):
+                                time.sleep(_WORKER_CHECK_INTERVAL)
+                            continue
+                        logging.info("[CleanupWorker] Cleanup operation completed")
+                except Exception:
+                    logging.exception("[CleanupWorker] Cleanup operation failed")
+                    if self._requeue_failed_stop_request(request):
+                        time.sleep(_WORKER_CHECK_INTERVAL)
             except Exception:
                 logging.exception("[CleanupWorker] Worker error")
                 time.sleep(0.1)
 
     def _reset_state(self) -> None:
         """重置为 IDLE 会话：关 binding、清信箱、清遥测与臂状态，并重置 provider policy。"""
-        self._cancel_source_reconnect_timers(clear_deadline=True)
         self.source_registry.begin_scan()
         with self._data_lock:
             self._close_binding_locked()
@@ -1158,6 +1089,9 @@ class JoystickController:
             self.state.quest_transport_generation = 0
             self.state.device_status = {}
             self._clear_input_cells()
+            self.state.waist = {"status": "unavailable", "following": False,
+                                "mode": None, "error": None}
+            self.state.arm_angle = None
             self.state.arm_states = {
                 "master": {
                     "ip": None,
@@ -1206,196 +1140,120 @@ class JoystickController:
         return self.source_registry.resolve_device(address, name)
 
     def _handle_input_batch(self, batch: RawInputBatch, provider_identity) -> None:
-        """校验、适配并提交一次 provider 中立的输入事务。
+        """输入线程校验 lease、处理策略并一次发布冻结双手帧。
 
-        提交规则：gate 前快照 ``bound_hands``；policy 推进与冻结帧发布在同一个
-        ``_policy_lock`` 临界区；之后在 data 锁内更新标志与 ``data_sequence``。
-
-        Args:
-            batch: provider 构造的原始输入批次
-            provider_identity: provider 侧身份，用于 ``callback_matches`` 复核
+        稳态不持 data 锁；只有就绪状态变化才进入会话临界区。输入策略与断续计数
+        由输入线程独占，其他线程清空后迟到的旧 lease 帧由读者过滤。
 
         Raises:
             ValueError: 批次的 provider identity 缺失。
         """
-        batch = validate_raw_input_batch(batch)
+        publication = None
+        if not isinstance(batch, RawInputBatch):
+            raise TypeError("input modules must publish RawInputBatch instances")
         if provider_identity is None:
             raise ValueError("provider identity is required for input batches")
-        with self._data_lock:
-            module = self.source_registry.active_module()
-            binding = self.active_source_binding
+        module = self.source_registry.active_module()
+        binding = self.active_source_binding
+        if (
+            binding is None
+            or module is None
+            or binding.phase is BindingPhase.CLOSED
+            or binding.lease != batch.lease
+        ):
+            return
+        bound_hands = {
+            update.hand
+            for update in batch.hands
             if (
-                binding is None
-                or module is None
-                or binding.phase is BindingPhase.CLOSED
-                or binding.lease != batch.lease
-                or not module.callback_matches(batch.lease, provider_identity)
-            ):
-                return
-            bound_hands = {
-                update.hand
-                for update in batch.hands
-                if (
-                    (controller := module.controller_for_hand(update.hand))
-                    is not None
-                    and self._is_hand_bound_active_locked(update.hand, controller)
-                )
-            }
-            # 会话标志（binding 相位/就绪）在 gate 之前推进：帧发布时控制线程
-            # 看到的会话状态已经就绪，不需要等待一次 data_sequence bump。
-            if binding.phase is BindingPhase.PROVISIONAL:
-                self._activate_binding_locked(
-                    batch.lease.provider_id,
-                    batch.lease.input_generation,
-                )
-            elif not binding.input_ready:
-                self._set_binding_input_ready_locked(
-                    batch.lease.provider_id,
-                    batch.lease.input_generation,
-                    True,
-                )
-        invalidated_controllers = set()
-        rejected_controllers = set()
-        publication = None
-        with self._policy_lock:
-            binding = self.active_source_binding
-            module = self.source_registry.active_module()
-            if (
-                binding is None
-                or module is None
-                or binding.phase is BindingPhase.CLOSED
-                or binding.lease != batch.lease
-                # 豁免：gate 内允许获取模块 lifecycle_lock（见 _policy_lock 注释）。
-                or not module.callback_matches(batch.lease, provider_identity)
-            ):
-                return
-            module.validate_input_batch(batch)
-            decisions = module.process_input_batch(
-                batch,
-                bound_hands,
-                binding.session_id,
-                self._control_params.epoch,
+                (controller := module.controller_for_hand(update.hand))
+                is not None
+                and self._is_hand_bound_active(update.hand, controller)
             )
-            # 双手同一批构建后一次 store：单手更新批次里另一手携带同一帧对象，
-            # 读者不会看到混合批次。
-            previous_publication = self._input_publication.load()
-            frames = {
-                hand: previous_publication.frame(hand)
-                if previous_publication is not None
-                else None
-                for hand in (HAND_LEFT, HAND_RIGHT)
-            }
-            for decision in decisions:
-                hand = decision.hand
-                update = next(update for update in batch.hands if update.hand == hand)
-                # 失效事件须在同一 gate 临界区内、store 之前发布，否则旧 attempt
-                # 会在"已 store、新纪元未发布"的窗口通过 admit。
-                if decision.controller is not None:
-                    if decision.invalidate_controller:
-                        decision.controller.publish_epoch()
-                        invalidated_controllers.add(decision.controller)
-                    elif decision.reject_controller:
-                        decision.controller.publish_target_rejection()
-                        rejected_controllers.add(decision.controller)
-                previous = frames[hand]
-                if previous is None:
-                    pose, button, control_sample, sequence = None, None, None, 0
-                else:
-                    pose, button = previous.pose, previous.button
-                    control_sample, sequence = previous.control_sample, previous.input_sequence
-                # 独立接受：位姿无效帧不阻塞按钮槽位刷新，反之亦然。
-                if decision.accept_pose:
-                    pose = update.pose
-                if decision.accept_button:
-                    button = update.button
-                sequence += 1
-                if decision.accept_pose and decision.accept_button:
-                    control_sample = UnifiedHandSample(
-                        hand=hand, pose=update.pose, button=update.button,
-                        pose_valid=update.pose_valid,
-                        input_sequence=sequence,
-                        source_frame_id=batch.batch_sequence,
-                        timestamp=max(update.pose.timestamp, update.button.timestamp),
-                        provider_id=batch.lease.provider_id,
-                        # 这是 Host 会话世代，不是 TCP/BLE 传输世代
-                        source_generation=batch.lease.input_generation,
-                        atomic=batch.atomic_batch,
-                    )
-                frames[hand] = HandInputFrame(
-                    hand=hand, pose=pose, button=button,
-                    control_sample=control_sample, input_sequence=sequence,
-                    lease=batch.lease, timestamp_monotonic=time.monotonic(),
+        }
+        self._accept_input_state(binding)
+        decisions = module.process_input_batch(batch, bound_hands)
+        # 双手同一批构建后一次 store：单手更新批次里另一手携带同一帧对象，
+        # 读者不会看到混合批次。
+        previous_publication = self._input_publication.load()
+        frames = {
+            hand: previous_publication.frame(hand)
+            if previous_publication is not None and previous_publication.lease == batch.lease
+            else None
+            for hand in (HAND_LEFT, HAND_RIGHT)
+        }
+        for decision in decisions:
+            hand = decision.hand
+            update = next(update for update in batch.hands if update.hand == hand)
+            generation = (batch.lease, batch.transport_generation)
+            previous_generation = self._input_transport_generations.get(hand)
+            if (decision.invalidate_controller or decision.reject_controller
+                    or (previous_generation is not None and previous_generation != generation)):
+                self._discontinuity_seq[hand] += 1
+            self._input_transport_generations[hand] = generation
+            previous = frames[hand]
+            if previous is None:
+                pose, button, intent, control_sample = None, None, None, None
+            else:
+                pose, button, intent = previous.pose, previous.button, previous.intent
+                control_sample = previous.control_sample
+            # 独立接受：位姿无效帧不阻塞按钮/功能结果刷新，反之亦然；按钮与功能结果成对刷新。
+            if decision.accept_pose:
+                pose = update.pose
+            if decision.accept_button:
+                button = update.button
+                intent = update.intent
+            # 显示独立刷新；控制读者比较样本序号，拒绝沿用旧控制样本。
+            self._input_sequences[hand] += 1
+            sequence = self._input_sequences[hand]
+            if decision.accept_pose and decision.accept_button:
+                control_sample = UnifiedHandSample(
+                    hand=hand, pose=update.pose, button=update.button, intent=update.intent,
+                    pose_valid=update.pose_valid,
+                    input_sequence=sequence,
+                    source_frame_id=batch.batch_sequence,
+                    timestamp=max(update.pose.timestamp, update.button.timestamp),
+                    provider_id=batch.lease.provider_id,
+                    # 这是 Host 会话世代，不是 TCP/BLE 传输世代
+                    source_generation=batch.lease.input_generation,
+                    atomic=batch.atomic_batch,
                 )
-                details = dict(decision.details)
-                if details.get("event"):
-                    logging.warning(
-                        "[JoystickController] Source policy event: %s hand=%s details=%s",
-                        details["event"],
-                        decision.hand,
-                        details,
-                    )
-            if decisions:
-                publication = InputPublication(
-                    left=frames[HAND_LEFT],
-                    right=frames[HAND_RIGHT],
-                    batch_sequence=batch.batch_sequence,
-                    lease=batch.lease,
-                    timestamp_monotonic=time.monotonic(),
+            frames[hand] = HandInputFrame(
+                hand=hand, pose=pose, button=button, intent=intent,
+                control_sample=control_sample, input_sequence=sequence,
+                lease=batch.lease, timestamp_monotonic=time.monotonic(),
+                discontinuity_seq=self._discontinuity_seq[hand],
+            )
+            details = dict(decision.details)
+            if details.get("event"):
+                logging.warning(
+                    "[JoystickController] Source policy event: %s hand=%s details=%s",
+                    details["event"],
+                    decision.hand,
+                    details,
                 )
-                self._input_publication.store(publication)
-        # gate 外唤醒控制线程（信号锁是叶子锁，不得在 gate 内获取）。
+        if decisions:
+            publication = InputPublication(
+                left=frames[HAND_LEFT],
+                right=frames[HAND_RIGHT],
+                batch_sequence=batch.batch_sequence,
+                lease=batch.lease,
+                timestamp_monotonic=time.monotonic(),
+                waist_input=batch.waist_input,
+                body_intent=batch.body_intent,
+                transport_generation=batch.transport_generation,
+            )
+            self._input_publication.store(publication)
         if publication is not None:
+            self._input_publication_sequence += 1
             self._publication_signal.notify()
-        # ``module.status`` 在 gate 外取：只读快照，只需模块自己的 lifecycle_lock，
-        # 不参与冻结帧提交。它供下面的 data 块使用，所以放在 data 块之前、gate 之后。
-        status = module.status(batch.lease)
-        with self._data_lock:
-            binding = self.active_source_binding
-            if (
-                binding is None
-                or binding.lease != batch.lease
-                or binding.phase is BindingPhase.CLOSED
-            ):
-                # 提交点之后会话才失效：撤销本次发布（“写入即失效”），
-                # 不让迟到发布者把已死会话的帧留在信箱里。
-                if publication is not None:
-                    self._withdraw_published_frames(publication)
-                return
-            details = dict(status.details)
-            self.state.ble_connected = True
-            if self.state.phase not in {
-                SessionPhase.INITIALIZING,
-                SessionPhase.READY,
-            }:
-                self._set_phase_locked(SessionPhase.CONNECTED)
-            self.state.last_error = None
-            self.state.source_type = binding.public_source_type
-            self.state.is_quest_device = bool(
-                binding.capabilities.supports_reconnect_grace
-            )
-            self.state.transport_state = status.phase
-            self.state.transport_terminal = False
-            self.state.quest_protocol_version = details.get("protocol_version")
-            self.state.quest_connection_id = details.get("connection_id")
-            self.state.quest_last_rx_monotonic = details.get("last_rx_monotonic")
-            self.state.quest_transport_generation = details.get(
-                "generation",
-                batch.transport_generation,
-            )
-            # 成对提交：本次 gate 预提交的 publication 在此与序号一起对观测可见
-            # （``decisions`` 为空时不发布，镜像保持上一份已提交内容）。
-            if publication is not None:
-                self._observed_input_publication.store(publication)
-            self.state.data_sequence += 1
-            for controller in rejected_controllers - invalidated_controllers:
-                controller.reject_pose_target()
-            for controller in invalidated_controllers:
-                # 双重发布：gate 内已发过纪元，这里再完整失效一次（偏保守，
-                # 只多拒绝不多放行），避免把状态清理拆分复制到 gate 内。
-                controller.invalidate_pose_mapping()
 
     def _close_source_lease(self, lease: SourceLease, reason: str) -> bool:
         """关闭一个 source lease（begin → close_connection → complete 三段，任一步失败即 False）。"""
+        with self._data_lock:
+            if (self._source_reconnect_deadline is not None
+                    and self._source_reconnect_deadline[0] == lease):
+                self._source_reconnect_deadline = None
         if not self.source_registry.begin_close(lease):
             return False
         module = self.source_registry.get_or_create(lease.provider_id)
@@ -1502,20 +1360,21 @@ class JoystickController:
             self.state.last_error = error_msg
         return []
 
-    def connect_device(self, address: str, name: str = "Unknown") -> ConnectResult:
+    def connect_device(self, address: str, name: str = "Unknown", direct: bool = False) -> ConnectResult:
         """连接指定设备并发布新的输入会话世代（须先完成扫描）。
 
         Args:
             address: 设备地址（来自最近一次扫描，未扫描过则拒绝）
             name: 设备显示名，仅用于状态展示
+            direct: 是否接管 Quest 直连待命链路（仅 Quest 支持）
         Returns:
             ConnectResult，含 outcome/message/retain_transport；失败一律以
             ``ConnectResult(FAILED, message, False)`` 返回并写入 ``last_error``
         """
         with self._lifecycle_lock:
-            return self._connect_device_locked(address, name)
+            return self._connect_device_locked(address, name, direct)
 
-    def _connect_device_locked(self, address: str, name: str) -> ConnectResult:
+    def _connect_device_locked(self, address: str, name: str, direct: bool = False) -> ConnectResult:
         """连接实现体（须已持有 ``_lifecycle_lock``）。"""
         with self._data_lock:
             if self.state.phase is SessionPhase.CLEANUP_FAILED:
@@ -1585,7 +1444,10 @@ class JoystickController:
                 )
                 self.state.data_sequence += 1
 
-            result = module.connect(candidate, lease, self)
+            result = (
+                module.connect(candidate, lease, self, direct=True)
+                if direct else module.connect(candidate, lease, self)
+            )
             with self._data_lock:
                 binding = self.active_source_binding
                 terminal_observed = self.state.transport_terminal
@@ -1737,7 +1599,7 @@ class JoystickController:
                 self.state.master_side,
                 slave_ip,
             )
-            profile = _active_arm_profile(self)
+            profile = active_arm_profile(self)
             if profile is not None:
                 if profile.require_same_board_dual and (
                     normalized_mode != "dual" or master_ip != slave_ip
@@ -1751,15 +1613,14 @@ class JoystickController:
                     )
                     if requested not in profile.modes:
                         raise ValueError("当前输入源不支持该遥操拓扑")
-                for arm_binding in bindings:
-                    index = profile.device_index_by_hand.get(arm_binding["hand"])
-                    if index is not None:
-                        arm_binding["device_index"] = index
+            apply_profile_device_indexes(bindings, profile)
             session = BaseArmSession(
                 self,
                 bindings,
                 self._build_command_controller,
                 self._end_effector_factory,
+                waist_factory=self._create_waist_runtime,
+                arm_angle_factory=self._create_arm_angle_runtimes,
             )
 
             logging.info(
@@ -1782,7 +1643,7 @@ class JoystickController:
             self.session = session
             success = session.initialize()
             if not success:
-                if session.arms:
+                if session.has_resources:
                     self.session = session
                     self.controller = session.get_primary_controller()
                 else:
@@ -1791,7 +1652,7 @@ class JoystickController:
                     self.state.arm_initialized = False
                     self._set_phase_locked(
                         SessionPhase.CLEANUP_FAILED
-                        if session.arms
+                        if session.has_resources
                         else self._stable_phase_locked()
                     )
                 return False
@@ -1803,9 +1664,9 @@ class JoystickController:
                 self._set_phase_locked(SessionPhase.READY)
             return True
         except JoystickConfigError as e:
-            if session is not None and not session.arms:
+            if session is not None and not session.has_resources:
                 self.session = None
-            if session is not None and session.arms:
+            if session is not None and session.has_resources:
                 self.session = session
                 self.controller = session.get_primary_controller()
             error_msg = f"遥操配置错误：{e}"
@@ -1814,15 +1675,15 @@ class JoystickController:
                 self.state.arm_initialized = False
                 self._set_phase_locked(
                     SessionPhase.CLEANUP_FAILED
-                    if session is not None and session.arms
+                    if session is not None and session.has_resources
                     else self._stable_phase_locked()
                 )
                 self.state.last_error = error_msg
             return False
         except Exception as e:
-            if session is not None and not session.arms:
+            if session is not None and not session.has_resources:
                 self.session = None
-            if session is not None and session.arms:
+            if session is not None and session.has_resources:
                 self.session = session
                 self.controller = session.get_primary_controller()
             error_msg = f"机械臂初始化异常：{str(e)}"
@@ -1832,7 +1693,7 @@ class JoystickController:
                 self.state.arm_initialized = False
                 self._set_phase_locked(
                     SessionPhase.CLEANUP_FAILED
-                    if session is not None and session.arms
+                    if session is not None and session.has_resources
                     else self._stable_phase_locked()
                 )
                 self.state.last_error = error_msg
@@ -1869,21 +1730,13 @@ class JoystickController:
             if not -180 <= value <= 180:
                 raise ValueError("calibration angle must be between -180 and 180")
             with self._data_lock:
-                affected_controllers = []
                 changed = self.state.calibration != value
                 self.state.calibration = value
                 if changed:
                     self._publish_control_params_locked()
-                    affected_controllers.extend(
-                        self._request_source_mapping_change_locked(
-                            "calibration_change"
-                        )
-                    )
                     self.state.data_sequence += 1
-                if changed:
-                    controllers = affected_controllers or self._active_pose_controllers()
-                    for controller in controllers:
-                        controller.invalidate_pose_mapping()
+            if self.direct_manager is not None:
+                self.direct_manager.update_parameter("yaw", value)
             return True
         except Exception as e:
             logging.error(f"[JoystickController] Invalid yaw value: {e}")
@@ -1912,30 +1765,48 @@ class JoystickController:
 
             with self._data_lock:
                 self.scale = value
-                affected_controllers = []
                 changed = self.state.scale != value
                 self.state.scale = value
                 if changed:
                     self._publish_control_params_locked()
-                    affected_controllers.extend(
-                        self._request_source_mapping_change_locked(
-                            "scale_change"
-                        )
-                    )
                     self.state.data_sequence += 1
-                if self.session:
-                    for runtime in self.session.arms:
-                        runtime.controller.scale = value
-                elif self.controller:
-                    self.controller.scale = value
-                if changed:
-                    controllers = affected_controllers or self._active_pose_controllers()
-                    for controller in controllers:
-                        controller.invalidate_pose_mapping()
+            if self.direct_manager is not None:
+                self.direct_manager.update_parameter("scale", value)
             return True
         except Exception as e:
             logging.exception(e)
             return False
+
+    def get_move_speed_level(self) -> Dict[str, Any]:
+        """读取当前遥操 move_joint 速度档位。
+
+        Returns:
+            dict：``{"level": 档位名, "speed": SDK speed 百分比}``
+        """
+        with self._data_lock:
+            level = self.move_speed_level
+        return {"level": level, "speed": MOVE_SPEED_LEVELS[level]}
+
+    def set_move_speed_level(self, level: str) -> bool:
+        """设置遥操 move_joint 速度档位，立即作用于当前会话的各臂。
+
+        Args:
+            level: ``MOVE_SPEED_LEVELS`` 中的档位名（low/medium/high）
+        Returns:
+            bool：写入成功为 True；非法档位记日志后返回 False
+        """
+        if level not in MOVE_SPEED_LEVELS:
+            logging.error("[JoystickController] Invalid move speed level: %r", level)
+            return False
+        speed = MOVE_SPEED_LEVELS[level]
+        with self._data_lock:
+            self.move_speed_level = level
+            if self.session:
+                for runtime in self.session.arms:
+                    runtime.controller.move_speed = speed
+            elif self.controller:
+                self.controller.move_speed = speed
+        return True
 
     def set_view_side(self, hand: str) -> bool:
         """设置当前查看侧（视图侧位姿/按钮直接由对应手信箱投影）。"""
@@ -1993,233 +1864,29 @@ class JoystickController:
             return False
 
     def get_observation_sequence(self) -> int:
-        """返回用于 SSE 变更检测的 ``data_sequence``。"""
+        """返回会话变化与输入发布计数之和（单调，供 SSE 变更检测）。"""
         with self._data_lock:
-            return self.state.data_sequence
+            return self.state.data_sequence + self._input_publication_sequence
 
     def get_observation_snapshot(self) -> ObservationSnapshot:
-        """抓取一份不可变、世代一致的 Host 观测快照（data 锁内读取并投影）。
-
-        Returns:
-            ObservationSnapshot；controller 不可用时返回 ``available=False`` 的空快照。
-        """
-        if not self.available:
-            empty_hand = ObservationHand.from_values()
-            return ObservationSnapshot(
-                sequence=0, available=False,
-                status=ObservationStatus(False, False, 1, -90, getattr(self, "scale", 0.4),
-                                         "not_available", None, "single",
-                                         False, HAND_RIGHT, HAND_RIGHT,
-                                         capabilities=None, arm_profile=None),
-                device=ObservationDevice(None, None),
-                transport=ObservationTransport("disconnected", None, None, None, None),
-                master_arm=ObservationArm(), slave_arm=ObservationArm(),
-                left_hand=empty_hand, right_hand=empty_hand, pose=None, button=None,
-                stream_terminal=True, emit_disconnect_frame=False)
-        with self._data_lock:
-            binding = self.active_source_binding
-            binding_active = bool(
-                binding is not None and binding.phase is not BindingPhase.CLOSED
-            )
-            # 能力与拓扑限制由 Host 投影出去，Web 刷新后不需要按 provider 名字猜测。
-            capabilities_payload = (
-                asdict(binding.capabilities) if binding is not None else None
-            )
-            arm_profile = _active_arm_profile(self) if binding is not None else None
-            arm_profile_payload = None if arm_profile is None else arm_profile.as_dict()
-            supports_reconnect_grace = bool(
-                binding is not None
-                and binding.capabilities.supports_reconnect_grace
-            )
-            last_rx_age_ms = (
-                    max(
-                        0,
-                        int(
-                            (
-                                time.monotonic()
-                                - self.state.quest_last_rx_monotonic
-                            )
-                            * 1000
-                        ),
-                    )
-                    if self.state.quest_last_rx_monotonic is not None
-                    else None
-                )
-            stream_connected = bool(
-                self.state.ble_connected
-                or (
-                    binding_active
-                    and supports_reconnect_grace
-                    and self.state.transport_state in {"negotiating", "healthy"}
-                )
-            )
-            emit_disconnect_frame = bool(
-                supports_reconnect_grace
-                and not binding_active
-                and not self.state.ble_connected
-            )
-            hands = {}
-            # 输入/关节各读一次观测镜像：镜像与 ``data_sequence`` 在同一 data 锁
-            # 临界区内成对提交，任一序号只映射一份观测内容；gate 预提交只对控制
-            # 路径即时可见，观测推迟到 data 阶段提交。
-            input_publication = self._observed_input_publication.load()
-            joint_publication = self._observed_joint_publication.load()
-            for hand in (HAND_LEFT, HAND_RIGHT):
-                input_frame = (
-                    None if input_publication is None
-                    else input_publication.frame(hand)
-                )
-                joint_frame = (
-                    None if joint_publication is None
-                    else joint_publication.frame(hand)
-                )
-                joint = None
-                if (
-                    joint_frame is not None and binding_active
-                    and binding is not None
-                    and binding.capabilities.provides_joint_targets
-                    and joint_frame.target is not None
-                ):
-                    target = joint_frame.target
-                    joint = {
-                        "switch_enabled": target.switch_enabled,
-                        "joint_positions": list(target.joint_positions),
-                        "trigger": target.trigger,
-                        "axis_x": target.axis_x,
-                        "axis_y": target.axis_y,
-                        "buttons": list(target.buttons),
-                        "fresh": time.monotonic() - joint_frame.received_monotonic <= _INPUT_FRESH_S,
-                        "sequence": joint_frame.batch_sequence,
-                        "reengage": reengage_payload(self._reengage_cells[hand].load()),
-                    }
-                hands[hand] = ObservationHand.from_values(
-                    joint=joint,
-                    pose=(
-                        pose_to_dict(input_frame.pose)
-                        if input_frame is not None and input_frame.pose
-                        else None
-                    ),
-                    button=(
-                        button_to_dict(input_frame.button)
-                        if input_frame is not None and input_frame.button
-                        else None
-                    ),
-                )
-            view_side = normalize_hand(self.state.view_side, HAND_RIGHT)
-            return ObservationSnapshot(
-                sequence=self.state.data_sequence, available=True,
-                pose=hands[view_side].pose,
-                button=hands[view_side].button,
-                status=ObservationStatus(stream_connected, self.state.arm_initialized,
-                    yaw_to_legacy_mode(self.state.calibration), self.state.calibration,
-                    self.state.scale, self.state.status,
-                    self.state.source_type,
-                    self.state.mode, self.state.is_quest_device, self.state.master_side,
-                    view_side,
-                    capabilities=capabilities_payload, arm_profile=arm_profile_payload,
-                    device_status=tuple(self.state.device_status.values())),
-                device=ObservationDevice(self.state.connected_address, self.state.connected_name),
-                transport=ObservationTransport(self.state.transport_state,
-                    self.state.quest_protocol_version, self.state.quest_connection_id,
-                    last_rx_age_ms, self.state.quest_last_disconnect_reason),
-                master_arm=ObservationArm.from_state(self.state.arm_states["master"]),
-                slave_arm=ObservationArm.from_state(self.state.arm_states["slave"]),
-                left_hand=hands[HAND_LEFT], right_hand=hands[HAND_RIGHT],
-                stream_terminal=bool(not self.state.ble_connected and (not supports_reconnect_grace or not binding_active)),
-                emit_disconnect_frame=emit_disconnect_frame)
+        """抓取一份世代一致的 Host 观测快照，见 ``build_observation_snapshot``。"""
+        return build_observation_snapshot(self)
 
     def get_status(self) -> dict:
         """获取当前状态（观测快照的 HTTP 投影）。"""
         return project_http_status(self.get_observation_snapshot())
 
-    def _build_init_position_controller(self) -> CommandController:
-        """旧接口确认型号前不展示假定型号的初始化位置。"""
-        controller = CommandController(self.scale, arm_role="master")
-        controller.init_joint_ = None
-        return controller
-
-    def confirm_init_position(self, ip: str) -> bool:
-        """通过本机控制端点确认初始化位置；ip 仅保留接口兼容。
-
-        Args:
-            ip: 管理 IP，仅用于日志（实际连本机 ``LOCAL_ARM_CONTROL_HOST``）
-        Returns:
-            bool：确认成功并缓存初始化位置为 True；异常/失败均返回 False
-        """
-        if not self.available:
-            logging.warning("[JoystickController] Controller not available")
-            return False
-
-        try:
-            if not self.init_position_controller:
-                logging.info("[JoystickController] Creating CommandController for init position confirmation")
-                self.init_position_controller = self._build_init_position_controller()
-
-            logging.info(
-                "[JoystickController] Resolving local temporary connection "
-                "from management_ip=%s to control_host=%s",
-                ip,
-                LOCAL_ARM_CONTROL_HOST,
-            )
-            success = self.init_position_controller.confirmInitPosition(LOCAL_ARM_CONTROL_HOST)
-            if success:
-                position = self.init_position_controller.getInitPosition().get("init_joint")
-                self.set_cached_init_position(self.init_position_controller.arm_model, position)
-                logging.warning("[JoystickController] Init position confirmed successfully")
-            else:
-                logging.error("[JoystickController] Failed to confirm init position")
-            return success
-        except Exception as e:
-            logging.error(f"[JoystickController] Exception during confirm init position: {str(e)}")
-            logging.exception(e)
-            return False
+    def confirm_init_position(self, *args, **kwargs) -> dict:
+        """确认初始化位置，见 ``ArmMaintenance.confirm_init_position``。"""
+        return self.maintenance.confirm_init_position(*args, **kwargs)
 
     def get_init_position(self) -> dict:
-        """获取接口覆盖、配置文件或原生默认值中的当前生效值。"""
-        if not self.available:
-            return {"init_joint": None, "error": "Controller not available"}
+        """读取当前生效的初始化位置，见 ``ArmMaintenance.get_init_position``。"""
+        return self.maintenance.get_init_position()
 
-        try:
-            if self.session and self.controller:
-                return self.controller.getInitPosition()
-            if not self.init_position_controller:
-                logging.info("[JoystickController] Creating CommandController for getting init position")
-                self.init_position_controller = self._build_init_position_controller()
-            return self.init_position_controller.getInitPosition()
-        except Exception as e:
-            error_msg = f"[JoystickController] Exception getting init position: {str(e)}"
-            logging.exception(e)
-            return {"init_joint": None, "error": error_msg}
-
-    def get_current_joints(self, ip: str) -> dict:
-        """通过本机控制端点获取当前主设备关节值；ip 仅保留接口兼容。"""
-        if not self.available:
-            return {
-                "current_joints": None,
-                "error": "Controller not available"
-            }
-
-        try:
-            if not self.controller:
-                logging.info("[JoystickController] Creating CommandController for getting current joints")
-                self.controller = CommandController(
-                    self.scale,
-                    arm_role="master",
-                )
-            logging.info(
-                "[JoystickController] Resolving local current-joints connection "
-                "from management_ip=%s to control_host=%s",
-                ip,
-                LOCAL_ARM_CONTROL_HOST,
-            )
-            return self.controller.getCurrentJoints(LOCAL_ARM_CONTROL_HOST)
-        except Exception as e:
-            error_msg = f"[JoystickController] Exception getting current joints: {str(e)}"
-            logging.exception(e)
-            return {
-                "current_joints": None,
-                "error": error_msg
-            }
+    def get_current_joints(self, *args, **kwargs) -> dict:
+        """临时读取当前关节值，见 ``ArmMaintenance.get_current_joints``。"""
+        return self.maintenance.get_current_joints(*args, **kwargs)
 
     def stop_session(self, stop_mode: str = "hold", reason: str = "unknown") -> bool:
         """停止遥操会话；仅显式 home 模式允许机械臂回零。
@@ -2276,7 +1943,8 @@ class JoystickController:
     def _stop_session_locked(self, stop_mode: str, reason: str) -> bool:
         """先失效输入，再重试每一个仍被持有的清理 owner。"""
 
-        self._cancel_source_reconnect_timers(clear_deadline=True)
+        with self._data_lock:
+            self._source_reconnect_deadline = None
 
         normalized_mode = (stop_mode or "hold").strip().lower()
         if normalized_mode not in ("hold", "home"):
@@ -2358,30 +2026,6 @@ class JoystickController:
             return False
         return True
 
-    def set_cached_init_position(self, model: str, position: List[float]) -> None:
-        """设置旧接口使用的进程内初始化位置。"""
-        if not _is_valid_joint_position(position, 6):
-            logging.error("[JoystickController] Position must contain exactly 6 finite numbers: %s", position)
-            return
-
-        try:
-            with self._data_lock:
-                self.cached_init_positions[model] = list(position)
-                logging.info("[JoystickController] Cached init position for %s: %s", model, position)
-        except Exception as e:
-            logging.error(f"[JoystickController] Error caching init position: {e}")
-
-    def get_cached_init_position(self, model: str) -> Optional[List[float]]:
-        """获取旧接口保存的进程内初始化位置。"""
-        try:
-            with self._data_lock:
-                cached_position = self.cached_init_positions.get(model)
-                if _is_valid_joint_position(cached_position, 6):
-                    logging.info("[JoystickController] Retrieved cached init position for %s: %s", model, cached_position)
-                    return cached_position.copy()
-                if cached_position:
-                    logging.warning("[JoystickController] Cached position validation failed. Position: %s", cached_position)
-                return None
-        except Exception as e:
-            logging.error(f"[JoystickController] Error retrieving cached init position: {e}")
-            return None
+    def get_cached_init_position(self, model: str, mode: str = "single", hand: Optional[str] = None):
+        """读取进程内的初始化位置覆盖值，见 ``ArmMaintenance.get_cached_init_position``。"""
+        return self.maintenance.get_cached_init_position(model, mode, hand)

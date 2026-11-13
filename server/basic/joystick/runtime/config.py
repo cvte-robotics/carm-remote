@@ -29,49 +29,79 @@ DEFAULT_JOYSTICK_CONFIG: Dict[str, Any] = {
         "A3_C": {
             "single": {
                 "init_joint": [-0.000192, 1.56713, -0.956551, 0.018883, 0.907339, -0.004005],
+                "home_joint": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                "teleop_reset_joint": [-0.000192, 1.56713, -0.956551, 0.018883, 0.907339, -0.004005],
             },
             "dual": {
                 "left": {
                     "init_joint": [-0.000192, 1.56713, -0.956551, 0.018883, 0.907339, -0.004005],
+                    "home_joint": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                    "teleop_reset_joint": [-0.000192, 1.56713, -0.956551, 0.018883, 0.907339, -0.004005],
                 },
                 "right": {
                     "init_joint": [-0.000192, 1.56713, -0.956551, 0.018883, 0.907339, -0.004005],
+                    "home_joint": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                    "teleop_reset_joint": [-0.000192, 1.56713, -0.956551, 0.018883, 0.907339, -0.004005],
                 },
             },
         },
         "A3_T": {
             "single": {
                 "init_joint": [0.002811, 1.556416, -1.010268, 0.974864, -0.013982, 0.011311],
+                "home_joint": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                "teleop_reset_joint": [0.002811, 1.556416, -1.010268, 0.974864, -0.013982, 0.011311],
             },
             "dual": {
                 "left": {
                     "init_joint": [0.002811, 1.556416, -1.010268, 0.974864, -0.013982, 0.011311],
+                    "home_joint": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                    "teleop_reset_joint": [0.002811, 1.556416, -1.010268, 0.974864, -0.013982, 0.011311],
                 },
                 "right": {
                     "init_joint": [0.002811, 1.556416, -1.010268, 0.974864, -0.013982, 0.011311],
+                    "home_joint": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                    "teleop_reset_joint": [0.002811, 1.556416, -1.010268, 0.974864, -0.013982, 0.011311],
                 },
             },
         },
         "A3_S": {
             "single": {
                 "init_joint": [0.002461, 1.293866, -0.754631, 0.018857, 0.586803, -0.001139],
+                "home_joint": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                "teleop_reset_joint": [0.002461, 1.293866, -0.754631, 0.018857, 0.586803, -0.001139],
             },
             "dual": {
                 "left": {
                     "init_joint": [0.002461, 1.293866, -0.754631, 0.018857, 0.586803, -0.001139],
+                    "home_joint": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                    "teleop_reset_joint": [0.002461, 1.293866, -0.754631, 0.018857, 0.586803, -0.001139],
                 },
                 "right": {
                     "init_joint": [0.002461, 1.293866, -0.754631, 0.018857, 0.586803, -0.001139],
+                    "home_joint": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                    "teleop_reset_joint": [0.002461, 1.293866, -0.754631, 0.018857, 0.586803, -0.001139],
                 },
             },
         },
         "D3": {
+            "arm_angle": {
+                "enabled": True,
+                "deadzone": 0.15,
+                "max_speed_deg_s": 45.0,
+                "min_deg": -170.0,
+                "max_deg": 170.0,
+                "min_step_deg": 0.2,
+            },
             "dual": {
                 "left": {
                     "init_joint": [0, 0, 0, -1.57, 0, 0, 0],
+                    "home_joint": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                    "teleop_reset_joint": [0, 0, 0, -1.57, 0, 0, 0],
                 },
                 "right": {
                     "init_joint": [0, 0, 0, -1.57, 0, 0, 0],
+                    "home_joint": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                    "teleop_reset_joint": [0, 0, 0, -1.57, 0, 0, 0],
                 },
             },
         },
@@ -109,9 +139,39 @@ def identify_arm_model(arm_name: str, arm_dof: int) -> str:
 
 @dataclass(frozen=True)
 class ArmControlConfig:
-    """单臂的不可变控制配置（当前只有初始关节角）。"""
+    """单臂的不可变控制配置。
+
+    init_joint：会话初始化位置；home_joint：停止遥操时的回零位置；
+    teleop_reset_joint：遥操中按回初始位键时的目标位置。
+    """
 
     init_joint: Tuple[float, ...]
+    home_joint: Tuple[float, ...]
+    teleop_reset_joint: Tuple[float, ...]
+
+
+@dataclass(frozen=True)
+class WaistControlConfig:
+    """D3 腰的统一控制配置；关节位置单位 rad。"""
+
+    enabled: bool = False
+    init_joint: Tuple[float, float] = (0.0, 0.0)
+    teleop_reset_joint: Tuple[float, float] = (0.0, 0.0)
+    home_joint: Tuple[float, float] = (0.0, 0.0)
+    max_speed_deg_s: float = 10.0
+    deadzone: float = 0.15
+
+
+@dataclass(frozen=True)
+class ArmAngleControlConfig:
+    """D3 单臂臂型角控制配置；角度单位为度。"""
+
+    enabled: bool = False
+    deadzone: float = 0.15
+    max_speed_deg_s: float = 45.0
+    min_deg: float = -170.0
+    max_deg: float = 170.0
+    min_step_deg: float = 0.2
 
 
 class JoystickConfigSnapshot:
@@ -129,7 +189,10 @@ class JoystickConfigSnapshot:
         self.load_error = load_error
 
     def resolve_arm(self, model: str, mode: str, side: str) -> ArmControlConfig:
-        """解析指定型号/模式/臂侧的初始化关节配置。
+        """解析指定型号/模式/臂侧的关节位置配置。
+
+        ``init_joint`` 必填；``home_joint`` 缺省为全零，``teleop_reset_joint`` 缺省
+        与 ``init_joint`` 相同（兼容只配置了初始化位置的旧配置文件）。
 
         Args: model 型号；mode "single"/"dual"；side "left"/"right"。
         Returns: 对应的 ArmControlConfig。
@@ -149,8 +212,18 @@ class JoystickConfigSnapshot:
         if mode == "dual":
             section = self._require_mapping(section, side, f"{path}.{side}")
             path += f".{side}"
-        return ArmControlConfig(self._require_joint_list(
-            section, "init_joint", 7 if model == "D3" else 6, f"{path}.init_joint"))
+        dof = 7 if model == "D3" else 6
+        init_joint = self._require_joint_list(section, "init_joint", dof, f"{path}.init_joint")
+        home_joint = (
+            self._require_joint_list(section, "home_joint", dof, f"{path}.home_joint")
+            if "home_joint" in section else (0.0,) * dof
+        )
+        teleop_reset_joint = (
+            self._require_joint_list(
+                section, "teleop_reset_joint", dof, f"{path}.teleop_reset_joint")
+            if "teleop_reset_joint" in section else init_joint
+        )
+        return ArmControlConfig(init_joint, home_joint, teleop_reset_joint)
 
     def resolve_quest_pose_jump(self) -> QuestPoseJumpConfig:
         """解析 Quest 位姿跳变阈值配置。
@@ -163,6 +236,78 @@ class JoystickConfigSnapshot:
             return resolve_quest_pose_jump(self._data)
         except ValueError as exc:
             raise JoystickConfigError(str(exc)) from exc
+
+    def resolve_waist(self) -> WaistControlConfig:
+        """解析 ``models.D3.waist``；缺省或 ``enabled=false`` 时腰不启用。
+
+        Raises: JoystickConfigError 字段类型或数值非法。
+        """
+        self._ensure_loaded()
+        section = self._data.get("models", {}).get("D3", {}).get("waist")
+        if section is None:
+            return WaistControlConfig()
+        if not isinstance(section, Mapping) or type(section.get("enabled")) is not bool:
+            raise JoystickConfigError("models.D3.waist.enabled 必须是布尔值")
+        if not section["enabled"]:
+            return WaistControlConfig()
+        init_joint = self._require_joint_list(section, "init_joint", 2, "models.D3.waist.init_joint")
+        teleop_reset_joint = (self._require_joint_list(section, "teleop_reset_joint", 2,
+                                                       "models.D3.waist.teleop_reset_joint")
+                              if "teleop_reset_joint" in section else init_joint)
+        home_joint = (self._require_joint_list(section, "home_joint", 2,
+                                               "models.D3.waist.home_joint")
+                      if "home_joint" in section else (0.0, 0.0))
+        max_speed = self._require_bounded_number(section, "max_speed_deg_s", 360.0,
+                                                 "models.D3.waist.max_speed_deg_s") \
+            if "max_speed_deg_s" in section else 10.0
+        deadzone = section.get("deadzone", 0.15)
+        if (isinstance(deadzone, bool) or not isinstance(deadzone, (int, float))
+                or not math.isfinite(deadzone) or not 0 <= deadzone < 1):
+            raise JoystickConfigError("models.D3.waist.deadzone 必须是 [0, 1) 范围内的有限数值")
+        if "scale" in section:
+            logging.warning("[JoystickConfig] models.D3.waist.scale 已废弃并被忽略：腰与手柄共用灵敏度")
+        return WaistControlConfig(True, init_joint, teleop_reset_joint, home_joint,
+                                  max_speed, float(deadzone))
+
+    def resolve_arm_angle(self) -> ArmAngleControlConfig:
+        """解析 ``models.D3.arm_angle``；缺省或关闭时不启用臂型角控制。"""
+        self._ensure_loaded()
+        section = self._data.get("models", {}).get("D3", {}).get("arm_angle")
+        if section is None:
+            return ArmAngleControlConfig()
+        if not isinstance(section, Mapping) or type(section.get("enabled")) is not bool:
+            raise JoystickConfigError("models.D3.arm_angle.enabled 必须是布尔值")
+        if not section["enabled"]:
+            return ArmAngleControlConfig()
+        deadzone = section.get("deadzone", 0.15)
+        if (isinstance(deadzone, bool) or not isinstance(deadzone, (int, float))
+                or not math.isfinite(deadzone) or not 0 <= deadzone < 0.9):
+            raise JoystickConfigError("models.D3.arm_angle.deadzone 必须是 [0, 0.9) 范围内的有限数值")
+        max_speed = self._require_bounded_number(
+            section, "max_speed_deg_s", 360.0, "models.D3.arm_angle.max_speed_deg_s")
+        min_deg = section.get("min_deg", -170.0)
+        max_deg = section.get("max_deg", 170.0)
+        if any(isinstance(value, bool) or not isinstance(value, (int, float))
+               or not math.isfinite(value) for value in (min_deg, max_deg)):
+            raise JoystickConfigError("models.D3.arm_angle.min_deg/max_deg 必须是有限数值")
+        if not -180 < min_deg < max_deg < 180:
+            raise JoystickConfigError("models.D3.arm_angle 必须满足 -180 < min_deg < max_deg < 180")
+        min_step = self._require_bounded_number(
+            section, "min_step_deg", 180.0, "models.D3.arm_angle.min_step_deg")
+        return ArmAngleControlConfig(
+            True, float(deadzone), max_speed, float(min_deg), float(max_deg), min_step)
+
+    def resolve_shared_connection(self) -> bool:
+        """解析 ``sdk.shared_connection``：同一控制端点的臂与腰是否共用一条 SDK 连接，缺省启用。
+
+        Raises: JoystickConfigError ``sdk`` 不是对象或开关不是布尔值。
+        """
+        self._ensure_loaded()
+        section = self._data.get("sdk", {})
+        value = section.get("shared_connection", True) if isinstance(section, Mapping) else None
+        if type(value) is not bool:
+            raise JoystickConfigError("sdk.shared_connection 必须是布尔值")
+        return value
 
     def _ensure_loaded(self) -> None:
         """确认配置已成功加载且根节点为对象。"""
@@ -246,3 +391,7 @@ def load_joystick_config(path: Optional[Path] = None) -> JoystickConfigSnapshot:
 
     logging.info("[JoystickConfig] 配置已加载，重启后端前不会重新读取: %s", config_path)
     return JoystickConfigSnapshot(data, config_path)
+
+
+# 进程内配置单例：进程启动时加载一次。
+JOYSTICK_CONFIG = load_joystick_config()

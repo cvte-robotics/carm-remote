@@ -2,8 +2,8 @@
 
 每周期把输入帧变成一次控制计算与 SDK 派发（关节路径优先，否则位姿路径），并维护
 按接受时刻身份钉扎的反馈缓存。调度：binding 声明 ``input_clocked_control`` 时新帧
-发布即唤醒（最长 1/72s 超时兜底）；否则按 72Hz 绝对时间节拍运行。``_policy_lock`` 是叶子 gate；锁序
-``pose_state_lock → _policy_lock``，data 锁只出现在低频旁路且总在最外层。
+发布即唤醒（最长 1/72s 超时兜底）；否则按 72Hz 绝对时间节拍运行。映射只由本臂
+控制线程写入，data 锁只用于再接入观测和终止凭证。
 """
 
 import logging
@@ -16,11 +16,7 @@ from typing import Any, Optional, Tuple
 
 from carm_teleop_input_contracts import (
     ControlAction,
-    ControlCompletion,
     ControlContext,
-    ControlOutcome,
-    ControlResult,
-    PolicyDispatchContext,
     ReengageStatus,
     HAND_RIGHT,
     normalize_hand,
@@ -35,6 +31,7 @@ _CONTROL_LOOP_HZ = 72.0
 _CONTROL_LOOP_INTERVAL = 1.0 / _CONTROL_LOOP_HZ
 _LIMIT_EPS = 1e-8
 _INPUT_FRESH_S = 0.2
+_DISPATCH_REJECT_LOG_INTERVAL_S = 1.0
 
 
 class ControlStepOutcome(Enum):
@@ -60,8 +57,7 @@ class LoopTermination:
     """控制环终止的冻结凭证（交给 Host 做收尾）。
 
     Host 通过 runtime、transaction、线程、session_id、source_lease 与
-    controller_identity 判断终止是否仍属于当前会话。``epoch`` 仅保留为终止时刻的
-    诊断快照；参数或映射纪元变化本身不会把当前控制线程的异常判为陈旧。
+    controller_identity 判断终止是否仍属于当前会话。
     """
 
     kind: LoopTerminationKind
@@ -69,33 +65,24 @@ class LoopTermination:
     runtime: Any
     transaction: Any
     session_id: Optional[int]
-    epoch: Any
     source_lease: Any
     controller_identity: Any
 
 
 @dataclass(frozen=True)
-class JointCommandAttempt:
-    """一次冻结的关节命令尝试（关节 provider 路径，控制环无 Host data 锁）。
-
-    ``publication`` 是本手帧所属的双手快照对象（身份即"本手帧仍是当前帧"）；
-    其余身份字段用于准入与 post 复核；``epoch`` 为冻结时 ``controller.current_epoch``
-    的对象身份，用于拒绝无效反馈后的在途 attempt。
-    """
+class JointControlInput:
+    """本周期关节输入、反馈和臂连接快照，不参与派发事务复核。"""
 
     hand: str
     frame: Any
-    publication: Any
     target: Any
     received: float
     binding: Any
     lease: Any
     session_id: int
     params_epoch: int
-    epoch: Any
     carm: Any
     ws: Any
-    state: Any
     arm_connection_generation: Any
     init_joint: Tuple
     feedback_joints: Any
@@ -129,6 +116,17 @@ class ControlTransaction:
         # 本步 ``_capture_sample`` 读到的本手帧（统计派发延迟与跳帧用）。
         self._captured_frame = None
         self._next_deadline = None
+        self._last_control_params = None
+        self._cycle_control_params = None
+        binding = owner.active_source_binding
+        self._last_source_lease = None if binding is None else binding.lease
+        self._handled_discontinuity_seq = 0
+        self._mapping_started = False
+        self._home_baseline_reset = False
+        self._rebase_frame_sequence = None
+        self._last_dispatched_sequence = None
+        self._dispatch_rejects = 0
+        self._dispatch_reject_logged = -math.inf
 
     def request_stop(self) -> None:
         """请求控制环退出（幂等）：置停止标志并唤醒可能在等待新帧的控制线程。"""
@@ -154,6 +152,9 @@ class ControlTransaction:
                 seen = signal.sequence if signal is not None else None
                 started = time.monotonic()
                 outcome = self._run_step()
+                arm_angle = getattr(self._runtime, "arm_angle", None)
+                if arm_angle is not None:
+                    arm_angle.tick()
                 finished = time.monotonic()
                 self._stats.record_step(started, finished, outcome)
                 self._stats.maybe_report(finished)
@@ -208,40 +209,73 @@ class ControlTransaction:
             ControlStepOutcome：本周期结束状态（无输入/已计算/已提交/已拒绝/身份失效）
         """
         controller = self._controller
-        arm_feedback_fresh = controller._refresh_current_pose()
-        self._observe_feedback(arm_feedback_fresh)
-        attempt = self._freeze_joint_attempt()
-        if attempt is not None:
-            self._stats.record_input(attempt.frame.batch_sequence)
-            outcome = self._run_joint_command(attempt)
-            if outcome is ControlStepOutcome.DISPATCH_COMMITTED:
-                self._stats.record_dispatch(
-                    attempt.frame.batch_sequence, attempt.received, time.monotonic(),
-                )
-            return outcome
-        self._captured_frame = None
-        outcome, sample = self._capture_sample(arm_feedback_fresh)
-        if sample is None:
-            return outcome
-        if sample.pose_data is None or sample.button_data is None:
-            controller.reject_pose_target()
+        if self._stop_event.is_set() or controller.isStop:
             return ControlStepOutcome.NO_INPUT
-        computation = controller.process_input_sample(sample)
-        if computation.joint_move is not None:
-            self._dispatch_joint_move(computation.joint_move)
-        if (
-            controller.current_target is not None
-            and controller.carm_
-            and controller.carm_.is_connected()
-        ):
-            outcome = self._dispatch_pose()
-            frame = self._captured_frame
-            if outcome is ControlStepOutcome.DISPATCH_COMMITTED and frame is not None:
-                self._stats.record_dispatch(
-                    frame.input_sequence, frame.timestamp_monotonic, time.monotonic(),
+        self._begin_control_cycle()
+        try:
+            arm_feedback_fresh = controller._refresh_current_pose()
+            self._observe_feedback(arm_feedback_fresh)
+            attempt = self._capture_joint_input()
+            if attempt is not None:
+                self._stats.record_input(attempt.frame.batch_sequence)
+                outcome = self._run_joint_command(attempt)
+                if outcome is ControlStepOutcome.DISPATCH_COMMITTED:
+                    self._stats.record_dispatch(
+                        attempt.frame.batch_sequence, attempt.received, time.monotonic(),
+                    )
+                return outcome
+            self._captured_frame = None
+            outcome, sample = self._capture_sample(arm_feedback_fresh)
+            if sample is None:
+                return outcome
+            if sample.pose_data is None or sample.intent_data is None:
+                controller.discard_home_intent(
+                    sample.intent_data, sample.home_identity, "incomplete_control_sample",
                 )
-            return outcome
-        return ControlStepOutcome.COMPUTED
+                controller.reject_pose_target()
+                return ControlStepOutcome.NO_INPUT
+            computation = controller.process_input_sample(sample)
+            if computation.joint_move is not None:
+                self._dispatch_joint_move(computation.joint_move)
+            if (
+                controller.current_target is not None
+                and controller.carm_
+                and controller.carm_.is_connected()
+            ):
+                outcome = self._dispatch_pose()
+                frame = self._captured_frame
+                if outcome is ControlStepOutcome.DISPATCH_COMMITTED and frame is not None:
+                    self._stats.record_dispatch(
+                        frame.input_sequence, frame.timestamp_monotonic, time.monotonic(),
+                    )
+                return outcome
+            return ControlStepOutcome.COMPUTED
+        finally:
+            self._cycle_control_params = None
+
+    def _begin_control_cycle(self):
+        """在控制线程内接收最新参数，并为参数变化失效一次映射。"""
+        params = self._owner._control_params
+        if self._last_control_params is None:
+            self._last_control_params = params
+        elif params is not self._last_control_params:
+            self._controller.invalidate_pose_mapping()
+            self._last_control_params = params
+        binding = self._owner.active_source_binding
+        lease = None if binding is None else binding.lease
+        if lease != self._last_source_lease:
+            self._controller.invalidate_pose_mapping()
+            self._last_source_lease = lease
+            self._handled_discontinuity_seq = None
+            self._rebase_frame_sequence = None
+            self._last_dispatched_sequence = None
+        self._cycle_control_params = params
+
+    def _control_params_for_cycle(self):
+        """返回本周期冻结的参数；直接调用内部采样辅助时回退到当前发布值。"""
+        if self._cycle_control_params is not None:
+            return self._cycle_control_params
+        return self._owner._control_params
 
     def _clear_feedback_cache(self):
         """清空反馈缓存（含连接对象身份钉扎字段）。"""
@@ -349,9 +383,9 @@ Args:
         self._feedback_carm = carm
         self._feedback_ws = accepted_ws
 
-    def _freeze_joint_attempt(self):
+    def _capture_joint_input(self):
         """
-冻结一个关节命令尝试；控制环不取 Host data 锁（一致性由发布侧提交规则保证）。
+读取本周期关节输入和反馈快照；控制环不取 Host data 锁。
 
 Returns:
     binding/module 不提供关节目标、或本手尚无关节帧时为 None。
@@ -370,7 +404,7 @@ Returns:
         frame = None if publication is None else publication.frame(hand)
         if frame is None:
             return None
-        params = owner._control_params
+        params = self._control_params_for_cycle()
         carm = controller.carm_
         # 复用缓存前必须复核身份：被暂停的控制线程可能在 SDK 重连换掉 carm.ws 之后
         # 恢复运行，此时“旧反馈 + 新 ws”会通过 OFF→ON 闸门。
@@ -380,15 +414,13 @@ Returns:
         except Exception:
             init_joint = ()
         age = self._current_feedback_age()
-        return JointCommandAttempt(
-            hand=hand, frame=frame, publication=publication, target=frame.target,
+        return JointControlInput(
+            hand=hand, frame=frame, target=frame.target,
             received=frame.received_monotonic,
             binding=binding, lease=frame.lease,
             session_id=binding.session_id,
             params_epoch=params.epoch,
-            epoch=controller.current_epoch,
             carm=carm, ws=getattr(carm, "ws", None),
-            state=getattr(carm, "state", None),
             arm_connection_generation=getattr(controller, "arm_connection_generation", None),
             init_joint=init_joint, feedback_joints=self._feedback_joints,
             feedback_age_s=age, now_monotonic=time.monotonic(),
@@ -408,7 +440,7 @@ Returns:
         )
 
     def _source_bound(self, hand: str) -> bool:
-        """``_is_hand_bound_active_locked`` 的控制环无锁等价物。
+        """``_is_hand_bound_active`` 的控制环无锁等价物。
 
         除 runtime/控制器身份外保留原有的"会话成员"语义：该 runtime 必须仍在
         ``session.arms`` 中（列表整体替换，原子引用读）。
@@ -424,56 +456,25 @@ Returns:
             getattr(arm, "controller", None) is self._controller for arm in arms
         )
 
-    def _joint_session_matches(self, attempt, require_current_frame=True):
-        """关节命令的准入/提交复核（调用前必须持有 ``_policy_lock``）。
-
-        Args:
-            attempt: 冻结的关节命令尝试
-            require_current_frame: True 时额外要求信箱中仍是同一个冻结帧对象、目标
-                存在且接收时间新鲜（发送前用）；False 时只做身份复核（post 用，
-                故意更弱）
-        Returns:
-            bool：全部身份与帧条件成立时为 True
-        """
-        owner, controller = self._owner, self._controller
-        binding = owner.active_source_binding
-        params = owner._control_params
-        if not (
+    def _arm_connection_matches(self, carm, ws, generation):
+        """只复核机械臂连接和停止请求；输入/参数变化由下一周期接收。"""
+        controller = self._controller
+        return bool(
             not self._stop_event.is_set() and not controller.isStop
-            and binding is not None
-            and binding.phase is BindingPhase.ACTIVE and binding.input_ready
-            and binding.lease == attempt.lease
-            and attempt.lease is not None
-            and binding.session_id == attempt.session_id
-            and params.epoch == attempt.params_epoch
-            # ControlEpoch 约束：无效反馈帧只发布新纪元（binding/参数/连接全不变），
-            # 因此必须比较纪元对象身份，否则新关节帧仍会通过 admit。
-            and controller.current_epoch is attempt.epoch
-            and owner.state.ble_connected
-            and self._source_bound(attempt.hand)
-            and controller.carm_ is attempt.carm
-            and getattr(attempt.carm, "ws", None) is attempt.ws
-            and getattr(controller, "arm_connection_generation", None) == attempt.arm_connection_generation
-        ):
-            return False
-        if require_current_frame:
-            # 发送要求信箱中仍是同一个冻结 publication（它携带本手的同一个帧对象）、
-            # 目标可用且接收时间新鲜；发送后的复核故意放宽这一条。
-            if (
-                owner._joint_publication.load() is not attempt.publication
-                or attempt.target is None
-                or time.monotonic() - attempt.received > _INPUT_FRESH_S
-            ):
-                return False
-        return True
+            and controller.carm_ is carm and carm is not None
+            and carm.is_connected()
+            and getattr(carm, "ws", None) is ws
+            and controller.arm_connection_generation == generation
+        )
 
     def _joint_context(self, attempt, **overrides):
-        """从冻结 attempt 构造 PolicyDispatch 上下文（字段与旧版逐字对应）。"""
+        """构造本周期关节计算上下文。"""
         context = dict(
             hand=attempt.hand, controller=self._controller,
             session_id=attempt.session_id,
             params_epoch=attempt.params_epoch,
-            bound_active=True, need_sync_feedback=False,
+            bound_active=True, need_sync_feedback=self._controller.need_sync_feedback,
+            discontinuity_seq=attempt.frame.discontinuity_seq,
             joint_target=attempt.target, feedback_joints=attempt.feedback_joints,
             feedback_age_s=attempt.feedback_age_s, now_monotonic=attempt.now_monotonic,
             init_joint=attempt.init_joint, lease=attempt.lease,
@@ -534,77 +535,57 @@ Returns:
         return kinematics
 
     def _run_joint_command(self, attempt):
-        """
-关节命令：冻结 → needs_kinematics → 锁外 FK → 复核 → decide → admit → post。
-
-顺序不可换：关节输入策略可能在 OFF→ON 边沿一次性消费开关状态并依赖
-FK 结果，decide 先于 FK 会让该周期永久拒绝。锁：只有叶子 ``_policy_lock``。
-
-Args:
-    attempt: 冻结的关节命令尝试。
-
-Returns:
-    ControlStepOutcome：本周期结束状态。
-"""
+        """关节路径在控制线程内计算一次，再经连接钉扎发送，不做 policy 事务复核。"""
         owner, controller = self._owner, self._controller
+        binding = attempt.binding
+        if (
+            binding.phase is not BindingPhase.ACTIVE or not binding.input_ready
+            or not owner.state.ble_connected or attempt.lease != binding.lease
+            or not self._source_bound(attempt.hand)
+            or attempt.target is None
+            or time.monotonic() - attempt.received > _INPUT_FRESH_S
+        ):
+            controller.invalidate_pose_mapping()
+            return ControlStepOutcome.NO_INPUT
+        if attempt.frame.discontinuity_seq != self._handled_discontinuity_seq:
+            controller.invalidate_pose_mapping()
+            self._handled_discontinuity_seq = attempt.frame.discontinuity_seq
         policy = attempt.module.control_policy
         if policy is None:
             return ControlStepOutcome.NO_INPUT
-        with owner._policy_lock:
-            if not self._joint_session_matches(attempt, require_current_frame=True):
-                return ControlStepOutcome.NO_INPUT
-            # 契约：needs_kinematics 在 gate 内运行（廉价），FK RPC 留在 gate 外。
-            needs_fk = bool(policy.needs_kinematics(self._joint_context(attempt)))
+        needs_fk = bool(policy.needs_kinematics(self._joint_context(attempt)))
         plan_pose = now_pose = None
         if needs_fk:
             kinematics = self._kinematics_for(attempt)
-            if attempt.target is not None:
-                plan_pose = kinematics(attempt.target.joint_positions)
+            plan_pose = kinematics(attempt.target.joint_positions)
             if attempt.feedback_joints is not None:
                 now_pose = kinematics(attempt.feedback_joints)
-        with owner._policy_lock:
-            if not self._joint_session_matches(attempt, require_current_frame=False):
-                return ControlStepOutcome.IDENTITY_INVALIDATED
-            decision = policy.decide_control(self._joint_context(
-                attempt,
-                feedback_age_s=self._current_feedback_age(controller),
-                now_monotonic=time.monotonic(),
-                plan_pose=plan_pose, now_pose=now_pose,
-            ))
+        computed = policy.compute_joint_command(self._joint_context(
+            attempt, feedback_age_s=self._current_feedback_age(controller),
+            now_monotonic=time.monotonic(), plan_pose=plan_pose, now_pose=now_pose,
+        ))
         self._publish_reengage(attempt, policy)
-        if decision.action is ControlAction.REJECT:
+        if computed is None:
             return ControlStepOutcome.NO_INPUT
-        if decision.action not in (ControlAction.TRACK_JOINT, ControlAction.MOVE_JOINT):
+        action, command = computed
+        if action not in (ControlAction.TRACK_JOINT, ControlAction.MOVE_JOINT) or command is None:
             return ControlStepOutcome.NO_INPUT
-        command = decision.command
-        if command is None:
-            return ControlStepOutcome.NO_INPUT
-        dispatch_ctx = PolicyDispatchContext(
-            attempt.hand, controller,
-            decision.source_token, attempt.session_id, attempt.params_epoch, True,
-        )
-        with owner._policy_lock:
-            if not self._joint_session_matches(attempt, require_current_frame=True):
-                return ControlStepOutcome.NO_INPUT
-            if not policy.validate_dispatch(dispatch_ctx):
-                return ControlStepOutcome.NO_INPUT
-            joints = self._clip_joints(command.joints, attempt.carm)
+        joints = self._clip_joints(command.joints, attempt.carm)
         if joints is None:
+            controller.invalidate_pose_mapping()
             return ControlStepOutcome.DISPATCH_REJECTED
 
         def admit():
-            """SDK 发送前准入：gate 内复核 attempt 身份并交给 policy validate_dispatch。"""
-            with owner._policy_lock:
-                if not self._joint_session_matches(attempt, require_current_frame=True):
-                    return False
-                return policy.validate_dispatch(PolicyDispatchContext(
-                    attempt.hand, controller,
-                    decision.source_token, attempt.session_id, attempt.params_epoch, True,
-                ))
+            """SDK 准入只保护停止请求与臂连接，不再复核输入帧。"""
+            return self._arm_connection_matches(
+                attempt.carm, attempt.ws, attempt.arm_connection_generation,
+            )
 
-        if decision.action is ControlAction.MOVE_JOINT:
+        if not admit():
+            return ControlStepOutcome.NO_INPUT
+        if action is ControlAction.MOVE_JOINT:
             result = attempt.carm.dispatch_joint_for_connection(
-                list(joints), attempt.ws, attempt.state, admit, command.duration_s or 5, False,
+                list(joints), attempt.ws, admit, controller.move_speed, False,
             )
         else:
             result = attempt.carm.dispatch_joint_target_for_connection(
@@ -612,25 +593,10 @@ Returns:
                 self._build_joint_end_effector_send(controller, attempt.hand, command.end_effector_trigger),
             )
         committed = result is True or type(result) is int and result == 1
-        with owner._policy_lock:
-            session_ok = self._joint_session_matches(attempt, require_current_frame=False)
-            outcome = (
-                ControlOutcome.DISPATCH_COMMITTED if committed else ControlOutcome.DISPATCH_REJECTED
-            )
-            if not session_ok:
-                outcome = ControlOutcome.STALE
-            policy.complete_control(ControlCompletion(
-                PolicyDispatchContext(
-                    attempt.hand, controller,
-                    decision.source_token, attempt.session_id, attempt.params_epoch, False,
-                ),
-                ControlResult(outcome, decision.source_token, outcome.value),
-            ))
-        self._publish_reengage(attempt, policy)
-        if not session_ok:
-            return ControlStepOutcome.IDENTITY_INVALIDATED
         if committed:
+            controller.need_sync_feedback = False
             return ControlStepOutcome.DISPATCH_COMMITTED
+        controller.invalidate_pose_mapping()
         return ControlStepOutcome.DISPATCH_REJECTED
 
     def _build_joint_end_effector_send(self, controller, hand, trigger):
@@ -638,7 +604,7 @@ Returns:
         driver = controller.end_effector_driver
 
         def send_end_effector():
-            """发送关节路径的末端触发值（驱动缺失只告警一次）。"""
+            """发送关节路径的末端触发值（驱动缺失只告警一次，发送失败由 EndEffectorSender 记录）。"""
             if trigger is None:
                 return
             if driver is None:
@@ -649,32 +615,22 @@ Returns:
                         hand,
                     )
                 return
-            try:
-                accepted = driver.set_eff(trigger)
-            except Exception:
-                logging.exception("[ControlTransaction] %s arm end-effector send raised", hand)
-                return
-            if accepted is not True:
-                logging.warning(
-                    "[ControlTransaction] %s arm end-effector send was not accepted: %r",
-                    hand, accepted,
-                )
+            driver.set_eff(trigger)
 
         return send_end_effector
 
     def _publish_reengage(self, attempt, policy):
         """
 发布再接入状态到每手单槽（控制线程写、SSE 读）；只有状态变化时才在 data 锁下
-bump ``data_sequence``。闸内读与 data 锁内 store 分两段，之间 binding 被替换则丢弃。
+推进 ``data_sequence``。计算时的 binding 已被替换则丢弃本次观察。
 None 是有效观察，须清除上一状态。
 """
         owner = self._owner
-        with owner._policy_lock:
-            status = policy.get_reengage_status(attempt.hand)
-            if status is not None and not isinstance(status, ReengageStatus):
-                raise TypeError("policy reengagement status must be ReengageStatus or None")
-            if not attempt.binding.capabilities.supports_reengagement:
-                status = None
+        status = policy.get_reengage_status(attempt.hand)
+        if status is not None and not isinstance(status, ReengageStatus):
+            raise TypeError("policy reengagement status must be ReengageStatus or None")
+        if not attempt.binding.capabilities.supports_reengagement:
+            status = None
         with owner._data_lock:
             if owner.active_source_binding is not attempt.binding:
                 return
@@ -692,332 +648,143 @@ None 是有效观察，须清除上一状态。
             )
 
     def _capture_sample(self, arm_feedback_fresh: bool):
-        """采样路径：无 data 锁读帧/binding/params，gate 内决策与帧身份复核。
-
-        Args:
-            arm_feedback_fresh: 本周期是否接受了新的臂反馈帧
-        Returns:
-            Tuple[ControlStepOutcome, Optional[ControlSample]]：需在本周期计算的
-            冻结样本，或 (结束状态, None)
-        """
-        owner = self._owner
-        controller = self._controller
-        normalized_hand = normalize_hand(controller.hand_binding, HAND_RIGHT)
+        """一次读取本手冻结帧；断续事件由本控制线程重定基并确认。"""
+        owner, controller = self._owner, self._controller
+        hand = normalize_hand(controller.hand_binding, HAND_RIGHT)
         binding = owner.active_source_binding
-        module = owner.source_registry.active_module()
-        policy = module.control_policy if module is not None else None
-        params = owner._control_params
-        # 单手读自**一次** publication 快照：双手来自同一次发布，不存在混合批次
-        # （见 mailbox 的"双手同批"节）。
-        input_publication = owner._input_publication.load()
-        frame = (
-            None if input_publication is None
-            else input_publication.frame(normalized_hand)
-        )
-        unified_sample = None if frame is None else frame.control_sample
+        params = self._control_params_for_cycle()
+        publication = owner._input_publication.load()
+        frame = None if publication is None else publication.frame(hand)
         if frame is not None:
             self._captured_frame = frame
             self._stats.record_input(frame.input_sequence)
-        session_id = binding.session_id if binding is not None else None
-        # 帧自身所属会话与其中控制样本的来源会话都必须对得上：迟到发布的旧帧
-        # 不得在当前会话被消费。
-        if (
-            unified_sample is None
-            or unified_sample.source_generation != session_id
-            or frame.lease != (binding.lease if binding is not None else None)
-        ):
-            controller.reject_pose_target()
-            return ControlStepOutcome.NO_INPUT, None
-        if not unified_sample.pose_valid or unified_sample.pose is None or unified_sample.button is None:
-            controller.reject_pose_target()
-            return ControlStepOutcome.NO_INPUT, None
-        # 控制路径只消费双接受的冻结样本，直接携带，不再投影回 legacy 视图。
-        button_data = unified_sample.button
-        pose_data = unified_sample.pose
-        input_ready = bool(
-            not self._stop_event.is_set()
-            and
-            binding is not None
-            and binding.phase is BindingPhase.ACTIVE
-            and binding.input_ready
-            and owner.state.ble_connected
+        if not self._home_baseline_reset:
+            # 新事务不补发上一事务期间累计的回初始位请求。
+            controller.reset_home_baseline()
+            self._home_baseline_reset = True
+        home_identity = (
+            None if frame is None
+            else (None if binding is None else binding.session_id, frame.lease)
         )
-        source_bound = self._source_bound(normalized_hand)
-        if not input_ready or not source_bound:
+
+        def discard_home(reason):
+            # 不可控期间的回初始位请求只消费不补发；位姿无效时控制样本保留旧值，
+            # 因此读帧上最新的功能结果。
+            if frame is not None:
+                controller.discard_home_intent(frame.intent, home_identity, reason)
+
+        if (
+            self._stop_event.is_set() or controller.isStop
+            or binding is None or binding.phase is not BindingPhase.ACTIVE
+            or not binding.input_ready or not owner.state.ble_connected
+            or not self._source_bound(hand)
+        ):
+            discard_home("input_not_ready_or_unbound")
             controller.invalidate_pose_mapping()
             return ControlStepOutcome.NO_INPUT, None
-
-        epoch = controller.current_epoch
-        with owner._policy_lock:
-            decision = (
-                policy.decide_control(ControlContext(
-                    hand=normalized_hand,
-                    controller=controller,
-                    session_id=session_id,
-                    params_epoch=params.epoch,
-                    bound_active=source_bound and input_ready,
-                    need_sync_feedback=bool(
-                        controller.need_sync_feedback
-                        and button_data is not None
-                        and button_data.grip > 100
-                    ),
-                ))
-                if module is not None
-                else None
-            )
-            # 帧身份复核：帧已被更新批次替换（decision 属于新帧）则放弃本周期，
-            # 不把旧帧载荷配上新帧 token。比较本手帧对象而非 publication 整体：
-            # 另一手的更新不必让本手白丢一拍。
-            current_publication = owner._input_publication.load()
-            frame_is_current = (
-                current_publication is not None
-                and current_publication.frame(normalized_hand) is frame
-            )
-        if not frame_is_current:
-            # 本周期放弃；新帧的发布会立即唤醒下一步（输入节拍）或在下一节拍处理。
+        sample = None if frame is None else frame.control_sample
+        if (
+            sample is None or frame.lease != binding.lease
+            or sample.input_sequence != frame.input_sequence
+            or sample.source_generation != binding.session_id
+            or not sample.pose_valid or sample.pose is None or sample.intent is None
+        ):
+            discard_home("missing_sample_or_source_identity_changed")
             controller.reject_pose_target()
             return ControlStepOutcome.NO_INPUT, None
-
-        if decision is not None and decision.action is ControlAction.REBASE:
-            token = decision.source_token
-            payload = decision.rebase_payload
-            raw_pose = getattr(payload, "raw_pose", None)
-            if token is None or button_data is None or raw_pose is None:
-                controller.reject_pose_target()
-                return ControlStepOutcome.NO_INPUT, None
-            with controller.pose_state_lock:
-                if controller.current_epoch is not epoch:
-                    controller.reject_pose_target()
-                    return ControlStepOutcome.IDENTITY_INVALIDATED, None
-                applied = controller._apply_input_rebase_locked(
-                    raw_pose,
-                    params.calibration,
-                    button_data,
-                    arm_feedback_fresh,
+        if not self._mapping_started:
+            # 新事务首个有效样本不能沿用上一线程的映射，必须同步新鲜反馈。
+            controller.invalidate_pose_mapping()
+            self._mapping_started = True
+        if controller.home_motion_pending(arm_feedback_fresh):
+            # 运动中的实测位姿不能当基线，否则回位结束后跟随会把臂拉回这里。
+            discard_home("home_motion_in_progress")
+            controller.reject_pose_target()
+            return ControlStepOutcome.NO_INPUT, None
+        intent = sample.intent
+        if (frame.discontinuity_seq != self._handled_discontinuity_seq
+                or (binding.capabilities.input_clocked_control
+                    and controller.need_sync_feedback and intent.motion_engaged)):
+            discard_home("input_rebase")
+            if not intent.motion_engaged:
+                controller.invalidate_pose_mapping()
+                applied = True
+            else:
+                pose = sample.pose
+                raw_pose = (pose.x, pose.y, pose.z, pose.qx, pose.qy, pose.qz, pose.qw)
+                applied = controller._apply_input_rebase(
+                    raw_pose, params.calibration, intent, arm_feedback_fresh,
                 )
-                committed_rebase = bool(
-                    applied
-                    and self._complete_rebase(
-                        policy, normalized_hand, controller, token, session_id, params.epoch,
-                    )
-                )
-            if committed_rebase:
+            if applied:
+                self._handled_discontinuity_seq = frame.discontinuity_seq
+                self._rebase_frame_sequence = frame.input_sequence
                 logging.warning(
-                    "[ControlTransaction] pose rebased: hand=%s reason=%s",
-                    normalized_hand,
-                    getattr(payload, "reason", ""),
+                    "[ControlTransaction] Input rebased: hand=%s discontinuity=%s",
+                    hand, frame.discontinuity_seq,
                 )
                 return ControlStepOutcome.REBASE_APPLIED, None
-            return ControlStepOutcome.IDENTITY_INVALIDATED, None
-
-        if decision is not None and decision.action is not ControlAction.READY:
+            # 未取得新鲜反馈或有效位姿时保持 pending，禁止旧目标泄漏。
             controller.reject_pose_target()
             return ControlStepOutcome.NO_INPUT, None
-
+        if frame.input_sequence == self._rebase_frame_sequence:
+            controller.reject_pose_target()
+            return ControlStepOutcome.NO_INPUT, None
+        if (binding.capabilities.input_clocked_control
+                and frame.input_sequence == self._last_dispatched_sequence):
+            controller.reject_pose_target()
+            return ControlStepOutcome.NO_INPUT, None
         return ControlStepOutcome.COMPUTED, ControlSample(
-            pose_data=pose_data,
-            button_data=button_data,
-            params=params,
-            input_sequence=(frame.input_sequence if frame is not None else 0),
-            session_id=session_id,
-            input_source=owner.active_input_source,
-            source_lease=binding.lease if binding is not None else None,
-            source_token=(decision.source_token if decision is not None else None),
-            epoch=epoch,
+            pose_data=sample.pose, button_data=sample.button, params=params,
             arm_connection_generation=controller.arm_connection_generation,
             arm_feedback_state_sequence=controller.arm_feedback_state_sequence,
             arm_feedback_fresh=arm_feedback_fresh,
+            intent_data=intent, home_identity=home_identity,
         )
-
-    def _complete_rebase(self, policy, hand, controller, token, session_id, params_epoch):
-        """在 gate 内提交 rebase（与 decide 串行化 policy 状态）。"""
-        with self._owner._policy_lock:
-            return (
-                policy.complete_control(ControlCompletion(
-                    PolicyDispatchContext(hand, controller, token, session_id, params_epoch),
-                    ControlResult(ControlOutcome.REBASE_APPLIED, token, "rebase"),
-                )).outcome
-                is ControlOutcome.REBASE_APPLIED
-            )
-
-    def _host_matches(self, attempt, module, lease, require_current_frame=True):
-        """Host 侧复核：本次 attempt 在控制环视角是否仍然有效（gate 内执行）。
-
-        Args:
-            attempt: 位姿派发事务
-            module: 捕获时的 provider module（按对象身份比较）
-            lease: 捕获时的 lease
-            require_current_frame: True 时要求信箱中当前帧的 input_sequence 与目标
-                一致（发送前用）；False 时跳过该子句（post 用）
-        Returns:
-            bool：runtime/binding/params/lease/policy 全部仍然成立时为 True
-        """
-        owner = self._owner
-        target = attempt.target_state
-        binding = owner.active_source_binding
-        # decide/准入/提交与 provider 的"policy 推进 + 帧发布"共用同一个 gate，
-        # 帧与按钮也在 gate 内读取（gate 外读到的陈旧 grip-on 会误放行/误报提交）。
-        # 锁序 pose_state_lock → _policy_lock；复核比较全部身份，不得只比较纪元。
-        with owner._policy_lock:
-            # gate 内读一次 publication 快照（而不是读两次每手 cell）：双手同批。
-            publication = owner._input_publication.load()
-            frame = (
-                None if publication is None
-                else publication.frame(attempt.hand_binding)
-            )
-            button_data = None if frame is None else frame.button
-            return bool(
-                self._runtime_matches(attempt.hand_binding)
-                and not self._stop_event.is_set()
-                and binding is not None
-                and binding.lease == lease
-                and binding.phase is BindingPhase.ACTIVE
-                and binding.input_ready
-                and binding.session_id == target.session_id
-                and owner.active_input_source == target.input_source
-                and owner.state.ble_connected
-                and (
-                    not require_current_frame
-                    or (frame is not None and frame.input_sequence == target.input_sequence)
-                )
-                and owner._control_params.epoch == target.params_epoch
-                and button_data is not None
-                and button_data.grip > 100
-                and owner.source_registry.active_module() is module
-                and module.control_policy.validate_dispatch(PolicyDispatchContext(
-                    hand=attempt.hand_binding,
-                    controller=self._controller,
-                    source_token=target.source_token,
-                    session_id=target.session_id,
-                    params_epoch=target.params_epoch,
-                    require_current_frame=require_current_frame,
-                ))
-            )
 
     def _dispatch_pose(self) -> ControlStepOutcome:
-        """
-完成一次位姿派发事务：捕获 attempt → gate 内复核 → 锁外发送 → post 复核。
-
-SDK 物理发送在 gate 外（否则控制环与 provider 回调互相阻塞）；pre-send 的
-``_host_matches`` 是最后一个准入点，post 复核捕获在途窗口的失效。
-
-Returns:
-    ControlStepOutcome。
-"""
-        owner = self._owner
+        """发送当前目标，成功则提交分段基线，失败则失效映射。"""
         controller = self._controller
-        module = owner.source_registry.active_module()
-        binding = owner.active_source_binding
-        if module is None or binding is None:
-            with controller.pose_state_lock:
-                controller.reject_pose_target()
+        if self._stop_event.is_set() or controller.isStop:
+            controller.reject_pose_target()
             return ControlStepOutcome.NO_INPUT
-        lease = binding.lease
-        with controller.pose_state_lock:
-            attempt = controller._capture_dispatch_attempt_locked()
-            if attempt is None or not self._host_matches(attempt, module, lease):
-                controller.reject_pose_target()
-                return ControlStepOutcome.IDENTITY_INVALIDATED
-
-        dispatched = controller.dispatch_pose_attempt(attempt)
-        if dispatched is not True:
-            logging.error(
-                "[ControlTransaction] track_pose rejected for %s: %r",
-                attempt.arm_role,
-                dispatched,
+        dispatched = controller.dispatch_pose()
+        if dispatched is True:
+            frame = self._captured_frame
+            if frame is not None:
+                self._last_dispatched_sequence = frame.input_sequence
+            return ControlStepOutcome.DISPATCH_COMMITTED
+        controller.invalidate_pose_mapping()
+        # 每次拒绝都会让下一个握持样本重定基；限频记录以区分发送失败与松开运动键。
+        self._dispatch_rejects += 1
+        now = time.monotonic()
+        if now - self._dispatch_reject_logged >= _DISPATCH_REJECT_LOG_INTERVAL_S:
+            logging.warning(
+                "[ControlTransaction] Pose dispatch rejected: role=%s result=%r count=%d",
+                getattr(controller, "arm_role", "unknown"), dispatched, self._dispatch_rejects,
             )
-
-        # post 复核须一致读 pose 状态（锁序 data > pose > gate），并与
-        # ``complete_control`` 在同一 gate 临界区内完成，否则其间 store 的新帧
-        # 会让失效派发被误报为已提交；invalidate 留在 gate 外。
-        with controller.pose_state_lock:
-            attempt_current = controller._dispatch_attempt_matches_locked(attempt)
-            outcome = None
-            with owner._policy_lock:
-                host_current = self._host_matches(
-                    attempt,
-                    module,
-                    lease,
-                    require_current_frame=False,
-                )
-                if attempt_current and host_current:
-                    if dispatched is not True:
-                        module.control_policy.complete_control(ControlCompletion(
-                            PolicyDispatchContext(attempt.hand_binding, controller, attempt.target_state.source_token, attempt.target_state.session_id, attempt.target_state.params_epoch, False),
-                            ControlResult(
-                                ControlOutcome.DISPATCH_REJECTED,
-                                attempt.target_state.source_token,
-                                "physical_dispatch_failed",
-                            ),
-                        ))
-                        outcome = ControlStepOutcome.DISPATCH_REJECTED
-                    else:
-                        result = module.control_policy.complete_control(ControlCompletion(
-                            PolicyDispatchContext(attempt.hand_binding, controller, attempt.target_state.source_token, attempt.target_state.session_id, attempt.target_state.params_epoch, False),
-                            ControlResult(
-                                ControlOutcome.DISPATCH_COMMITTED,
-                                attempt.target_state.source_token,
-                                "physical_dispatch_succeeded",
-                            ),
-                        ))
-                        if result.outcome is ControlOutcome.DISPATCH_COMMITTED:
-                            controller._commit_dispatch_attempt_locked(attempt)
-                            outcome = ControlStepOutcome.DISPATCH_COMMITTED
-                        else:
-                            outcome = ControlStepOutcome.DISPATCH_REJECTED
-            if outcome is None:
-                if attempt_current:
-                    controller.invalidate_pose_mapping()
-                return ControlStepOutcome.IDENTITY_INVALIDATED
-            if outcome is ControlStepOutcome.DISPATCH_REJECTED:
-                controller.invalidate_pose_mapping()
-            return outcome
-
-    def _joint_attempt_matches(self, attempt) -> bool:
-        """A 键关节运动 attempt 的身份复核（ControlEpoch 硬约束见函数内注释）。
-
-        Returns:
-            bool：停止标志、binding/lease/session/params/输入源、epoch 身份、
-            连接对象身份与连接代次全部成立时为 True
-        """
-        owner = self._owner
-        controller = self._controller
-        binding = owner.active_source_binding
-        # ControlEpoch 约束：除 current_epoch 身份外必须同时比较 binding 身份
-        # （lease/session）、ControlParams（params_epoch）与 arm_connection_generation。
-        return bool(
-            not self._stop_event.is_set()
-            and binding is not None
-            and binding.phase is BindingPhase.ACTIVE
-            and binding.input_ready
-            and owner.state.ble_connected
-            and binding.session_id == attempt.session_id
-            and owner._control_params.epoch == attempt.params_epoch
-            and owner.active_input_source == attempt.input_source
-            and not controller.isStop
-            and controller.current_epoch is attempt.epoch
-            and controller.arm_connection_generation == attempt.arm_connection_generation
-            and controller.carm_ is attempt.carm
-            and attempt.carm.ws is attempt.arm_ws_identity
-            and attempt.carm.state is attempt.arm_state_identity
-        )
+            self._dispatch_reject_logged = now
+            self._dispatch_rejects = 0
+        return ControlStepOutcome.DISPATCH_REJECTED
 
     def _dispatch_joint_move(self, attempt) -> bool:
-        """派发 A 键关节运动；发送前后各做一次 attempt 身份复核。"""
-        owner = self._owner
-        controller = self._controller
-        if not self._joint_attempt_matches(attempt):
-            logging.warning(
-                "[ControlTransaction] Input disconnected before A-button move"
+        """A 键运动只保留停止与臂连接准入，参数/输入变化留待下一周期处理。"""
+        def admit():
+            """SDK 发送前确认停止请求及当前机械臂连接。"""
+            return self._arm_connection_matches(
+                attempt.carm, attempt.arm_ws_identity, attempt.arm_connection_generation,
             )
-            return False
 
-        def admit() -> bool:
-            """SDK 发送前准入：gate 内复核 A 键关节运动 attempt 身份。"""
-            with owner._policy_lock:
-                return self._joint_attempt_matches(attempt)
-
-        return controller.dispatch_joint_move_attempt(attempt, admit)
+        result = admit() and self._controller.dispatch_joint_move_attempt(attempt, admit)
+        if result is True:
+            self._controller.begin_home_motion(attempt)
+        else:
+            # 按键序号已消费，不会补发；记录下来，否则操作者只看到"按了没反应"。
+            logging.warning(
+                "[ControlTransaction] Home motion not sent: role=%s result=%r",
+                getattr(self._controller, "arm_role", "unknown"), result,
+            )
+            self._controller.invalidate_pose_mapping()
+        return result is True
 
     def _termination(
         self,
@@ -1039,7 +806,6 @@ Returns:
                 runtime=self._runtime,
                 transaction=self,
                 session_id=binding.session_id if binding is not None else None,
-                epoch=controller.current_epoch,
                 source_lease=binding.lease if binding is not None else None,
                 controller_identity=controller,
             )

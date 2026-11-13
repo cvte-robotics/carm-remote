@@ -50,7 +50,7 @@ if (-not (Test-Path $VenvPython)) {
 $DependencyProbe = @'
 try:
     import importlib.metadata as metadata
-    import PyQt6, flask, werkzeug, numpy, scipy, websocket, zeroconf, carm
+    import PyQt6, flask, werkzeug, websocket, zeroconf, carm
     ready = metadata.version("carm") >= "0.1.20260819"
 except Exception:
     ready = False

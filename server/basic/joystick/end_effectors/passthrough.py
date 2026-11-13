@@ -76,22 +76,25 @@ class PassthroughEndEffector(EndEffectorBase):
     NAME = "passthrough"
 
     def __init__(self, context: EndEffectorContext, **options) -> None:
-        """校验臂侧并取用 Carm SDK 的透传发送接口。
+        """校验臂侧并取用 Carm 连接的只发不等接口。
 
-        Raises: ValueError 臂侧不支持；RuntimeError SDK 不支持透传。
+        Raises: ValueError 臂侧不支持；RuntimeError Carm 封装不支持只发不等。
         """
         super().__init__(context, **options)
         normalized_side = (context.side or "").strip().lower()
         if normalized_side not in SLAVE_IDS:
             raise ValueError(f"unsupported hand side: {context.side}")
-        sender = getattr(self.carm, "set_ecat_passthrough_data", None)
+        sender = getattr(self.carm, "send_only", None)
         if not callable(sender):
-            raise RuntimeError("current Carm SDK does not support end-effector passthrough")
+            raise RuntimeError("current Carm adapter does not support send_only passthrough")
         self._sender = sender
         self._side = normalized_side
 
     def set_eff(self, trigger: int) -> bool:
-        """把 trigger 映射为六指位置，逐指下发透传帧。
+        """把 trigger 映射为六指位置，逐指只发不等地下发透传帧。
+
+        报文与 SDK ``set_ecat_passthrough_data`` 的发送模式（mode 0）一致；该接口会同步
+        等待并严格解析回复，遥操控制周期内不能使用。
 
         Args: trigger 为 provider 归一化后的触发值（按 0-127 归一化到 0-1000）。
         Returns: 恒为 True（单指异常只记录日志，不中断其余手指）。
@@ -109,7 +112,12 @@ class PassthroughEndEffector(EndEffectorBase):
         for finger_id in range(FINGER_COUNT):
             frame = build_hand_frame(self._side, finger_id, position)
             try:
-                self._sender(0, frame)
+                self._sender({
+                    "command": "setEcatCanPassthroughData",
+                    "arm_index": self.carm.arm_index,
+                    "mode": 0,
+                    "data": frame,
+                })
             except Exception:
                 logging.exception(
                     "[PassthroughEndEffector] Send exception side=%s finger=%d",

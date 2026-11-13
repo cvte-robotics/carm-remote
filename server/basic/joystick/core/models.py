@@ -2,7 +2,7 @@
 
 from typing import Any, Dict, Optional
 
-from carm_teleop_input_contracts import ButtonSample, PoseSample
+from carm_teleop_input_contracts import ButtonSample, HandIntentSample, PoseSample
 
 
 def _vector(values) -> list:
@@ -12,6 +12,25 @@ def _vector(values) -> list:
         float(values[1]) if len(values) > 1 else 0.0,
         float(values[2]) if len(values) > 2 else 0.0,
     ]
+
+
+def head_pose_to_dict(sample) -> Optional[Dict[str, Any]]:
+    """投影头盔位姿、有效性与重定位次数。"""
+    if sample is None:
+        return None
+    head = sample.head
+    return {"mode": sample.mode, "x": head.x, "y": head.y, "z": head.z,
+            "qx": head.qx, "qy": head.qy, "qz": head.qz, "qw": head.qw,
+            "valid": sample.head_valid, "recenter_count": sample.recenter_count}
+
+
+def body_intent_to_dict(sample) -> Optional[Dict[str, Any]]:
+    """投影机身功能的 lease 内累计序号。"""
+    if sample is None:
+        return None
+    return {"waist_follow_sequence": sample.waist_follow_sequence,
+            "waist_home_sequence": sample.waist_home_sequence,
+            "waist_stick": list(sample.waist_stick)}
 
 
 def pose_to_dict(pose: Optional[PoseSample]) -> Optional[Dict[str, Any]]:
@@ -57,4 +76,17 @@ def button_to_dict(button: Optional[ButtonSample]) -> Optional[Dict[str, Any]]:
         "joystick_z": button.joystick_z,
         "menu_capture": button.menu_capture,
         "timestamp": button.timestamp,
+    }
+
+
+def intent_to_dict(intent: Optional[HandIntentSample]) -> Optional[Dict[str, Any]]:
+    """功能结果独立投影，原始 button 字段保持兼容。"""
+    if intent is None:
+        return None
+    return {
+        "motion_engaged": intent.motion_engaged,
+        "rotation_locked": intent.rotation_locked,
+        "end_effector": intent.end_effector,
+        "home_sequence": intent.home_sequence,
+        "arm_angle_stick": list(intent.arm_angle_stick),
     }

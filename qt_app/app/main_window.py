@@ -194,6 +194,24 @@ def format_device_status(items: Any) -> str:
     return "&nbsp;&nbsp;&nbsp;".join(parts)
 
 
+WAIST_STATUS_TEXT = {
+    "unavailable": "腰控制未启用，初始化时检查设备与输入支持",
+    "legacy_input": "当前 APK 不支持腰控制，双臂仍可遥操",
+    "disabled": "配置中未启用腰控制",
+    "absent": "当前设备无腰关节，双臂仍可遥操",
+    "connecting": "正在连接腰关节",
+    "returning_init": "腰正在回初始化位置",
+    "idle": "就绪；按当前方式绑定的腰跟随键开始/停止跟随，腰回初始位键回位",
+    "waiting_center": "摇杆方式已暂停：按腰跟随键后请先回中摇杆",
+    "following": "正在跟随当前方式输入",
+    "returning_zero": "腰正在回零",
+    "waiting_input": "已停止跟随：头盔数据中断或重定位，恢复后需重新触发头显中绑定的腰跟随键",
+    "waiting_feedback": "已停止跟随：等待腰反馈恢复并确认停止",
+    "fault": "腰控制异常",
+    "stopped": "腰控制已停止",
+}
+
+
 class MainWindow(QMainWindow):
     def __init__(self, parent=None, *, end_effector: str = "carm"):
         super().__init__(parent)
@@ -312,6 +330,10 @@ class MainWindow(QMainWindow):
         self.side.addItem("作为左臂", "left")
         self.side.addItem("作为右臂", "right")
         form.addRow(_field_label("当前机械臂:"), self.side)
+        self.waist_status = QLabel()
+        self.waist_status.setTextFormat(Qt.TextFormat.PlainText)
+        self.waist_status.setWordWrap(True)
+        form.addRow(self.waist_status)
         self.view_side = QComboBox()
         self.view_side.addItem("左手柄", "left")
         self.view_side.addItem("右手柄", "right")
@@ -377,6 +399,7 @@ class MainWindow(QMainWindow):
             data.addLayout(box, 1)
         layout.addLayout(data, 2)
         form.setRowVisible(self.other_ip, False)
+        form.setRowVisible(self.waist_status, False)
         self._controls = [self.scan_button, self.init_button, self.stop_button, self.profile, self.other_ip, self.side, self.view_side, self.scale, self.calibration_slider]
 
     def invalidate_scan(self) -> None:
@@ -409,6 +432,7 @@ class MainWindow(QMainWindow):
         self.devices.setEnabled(name == "ScanReady")
         self.render_status_tone(name)
         self.render_device_status()
+        self.render_waist_status(self.vm.snapshot)
 
     def render_status_tone(self, name: str) -> None:
         tone = STATE_TONES.get(name, "idle")
@@ -428,10 +452,36 @@ class MainWindow(QMainWindow):
         _set_plain_text_keep_scroll(self.buttons, json.dumps(snapshot.button, ensure_ascii=False, indent=2) if snapshot.button is not None else "暂无按钮信息")
         self._device_status_items = snapshot.status.get("device_status") or []
         self.render_device_status()
+        self.render_waist_status(snapshot)
 
     def render_device_status(self) -> None:
         connected = self.vm.state.name in DEVICE_STATUS_STATES
         self.device_status.setText(format_device_status(self._device_status_items) if connected else "")
+
+    def render_waist_status(self, snapshot: Snapshot) -> None:
+        if self.profile.currentData() != "d3_dual":
+            self.waist_status.clear()
+            return
+        if self.vm.state.name == "Stopping":
+            # 手动停止会关闭 SSE，不能把最后一帧显示为仍在跟随。
+            self.waist_status.setText("腰控制：正在停止，已启用的腰将回零，等待后端确认")
+            return
+        if self.vm.state.name not in {"Connected", "Initializing", "Teleoperating"}:
+            self.waist_status.setText("腰控制：初始化时检查设备与输入支持")
+            return
+        waist = snapshot.status.get("waist")
+        if not isinstance(waist, dict):
+            self.waist_status.setText("腰控制：未收到腰状态，请确认后端支持头盔腰控制")
+            return
+        message = WAIST_STATUS_TEXT.get(waist.get("status"), "腰状态未知，请检查后端版本")
+        mode = {"head": "头盔", "stick": "摇杆"}.get(waist.get("mode"), "未选择")
+        if waist.get("status") == "following" and waist.get("mode") == "stick":
+            message = "正在跟随绑定的腰摇杆"
+        elif waist.get("status") == "idle" and waist.get("mode") == "stick":
+            message = "就绪；按腰跟随键开始，回中后用绑定的腰摇杆控制"
+        label = f"腰控制（{mode}）【跟随中】" if waist.get("following") else f"腰控制（{mode}）【未跟随】"
+        error = waist.get("error")
+        self.waist_status.setText(f"{label}：{message}" + (f"；{error}" if error else ""))
 
     def render_profiles(self, profiles: list[str]) -> None:
         self.profile.blockSignals(True)
@@ -445,6 +495,9 @@ class MainWindow(QMainWindow):
         self._config_form.setRowVisible(self.other_ip, self.profile.currentData() == "a3_dual")
         # 人形双臂固定左手柄控左臂（index 0）、右手柄控右臂（index 1），无需选择当前臂。
         self._config_form.setRowVisible(self.side, self.profile.currentData() != "d3_dual")
+        is_d3 = self.profile.currentData() == "d3_dual"
+        self._config_form.setRowVisible(self.waist_status, is_d3)
+        self.render_waist_status(self.vm.snapshot)
 
     def device_double_clicked(self, item) -> None:
         device = item.data(Qt.ItemDataRole.UserRole)

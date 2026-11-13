@@ -11,12 +11,26 @@ import socket
 import threading
 import time
 import uuid
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, FrozenSet, Optional
 
 from .constants import (
     QUEST_PROTOCOL_PREFIX, QUEST_LINE_LIMIT, QUEST_SEND_QUEUE_LIMIT,
     QUEST_PROTOCOL_VERSION, QUEST_HANDSHAKE_TIMEOUT, QUEST_RX_TIMEOUT,
+    QUEST_CAPABILITY_INTENT_V1, QUEST_CORE_INTENTS, QUEST_CAPABILITY_WAIST_CONTROL_V1,
+    QUEST_CAPABILITY_SESSION_SETUP_V1, QUEST_SUPPORTED_CAPABILITIES,
+    QUEST_INTENT_FIELDS, QUEST_INTENT_NAME_PATTERN,
 )
+
+
+def _analog_value(value, lower):
+    """保留旧协议的整数直通、浮点缩放、越界截断及不可转换值归零语义。"""
+    if isinstance(value, int):
+        return int(max(lower, min(127, value)))
+    try:
+        raw = float(value)
+    except (TypeError, ValueError):
+        raw = 0.0
+    return int(max(lower, min(127, round(raw * 127.0))))
 
 
 class QuestTcpReceiver:
@@ -33,12 +47,16 @@ class QuestTcpReceiver:
         frame_callback: Callable[..., None],
         disconnect_callback: Callable[..., None],
         status_callback: Optional[Callable[..., None]] = None,
+        control_callback: Optional[Callable[..., None]] = None,
+        negotiated_callback: Optional[Callable[..., None]] = None,
     ):
         self.host = host
         self.port = port
         self.frame_callback = frame_callback
         self.disconnect_callback = disconnect_callback
         self.status_callback = status_callback
+        self.control_callback = control_callback
+        self.negotiated_callback = negotiated_callback
         self._server_socket = None
         self._client_socket = None
         self._thread = None
@@ -50,15 +68,49 @@ class QuestTcpReceiver:
         self._connection_generation = 0
         self.protocol_state = "Listening"
         self.protocol_version = None
+        self.capabilities = frozenset()
+        self._declared_intents = frozenset()
         self.connection_id = None
         self.client_id = None
         self.connection_negotiated = False
         self.last_valid_rx_monotonic = None
         self.last_heartbeat_seq = None
+        self.last_request_id = None
         self.handshake_event = threading.Event()
         self.first_frame_event = threading.Event()
         self.disconnect_notified = False
         self.last_error = None
+
+    @property
+    def intent_v1_enabled(self) -> bool:
+        """当前连接是否协商了功能意图输入。"""
+        return QUEST_CAPABILITY_INTENT_V1 in self.capabilities
+
+    @property
+    def waist_control_v1_enabled(self) -> bool:
+        """当前连接是否协商了统一腰控制扩展。"""
+        return QUEST_CAPABILITY_WAIST_CONTROL_V1 in self.capabilities
+
+    @property
+    def link_ready(self) -> bool:
+        """当前是否有已完成握手、仍在线的 APK 连接。"""
+        return self._connected and self.connection_negotiated
+
+    @property
+    def listening(self) -> bool:
+        """监听线程是否仍在运行（监听失败后需要重建）。"""
+        thread = self._thread
+        return self._running and thread is not None and thread.is_alive()
+
+    @property
+    def session_setup_v1_enabled(self) -> bool:
+        """当前连接是否协商了直连会话配置能力。"""
+        return QUEST_CAPABILITY_SESSION_SETUP_V1 in self.capabilities
+
+    @property
+    def declared_intents(self) -> FrozenSet[str]:
+        """当前连接声明的功能字段（包括允许但忽略的未知字段），只读。"""
+        return self._declared_intents
 
     @property
     def connection_generation(self) -> int:
@@ -80,6 +132,9 @@ class QuestTcpReceiver:
         self.first_frame_event.clear()
         self.handshake_event.clear()
         self.last_error = None
+        self.protocol_version = None
+        self.capabilities = frozenset()
+        self._declared_intents = frozenset()
         self._server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._server_socket.bind((self.host, self.port))
@@ -210,14 +265,58 @@ class QuestTcpReceiver:
         return is_control, payload
 
     @staticmethod
-    def _is_valid_pose_payload(payload: Dict[str, Any]) -> bool:
-        """校验一帧 pose 数据的字段齐备性与数值合法性。
+    def _parse_declared_intents(payload: Dict[str, Any], capabilities: FrozenSet[str]) -> FrozenSet[str]:
+        """校验 hello 功能声明；旧 intent_v1 APK 缺省为固定核心字段集合。"""
+        if QUEST_CAPABILITY_INTENT_V1 not in capabilities:
+            if "intents" in payload:
+                raise ValueError("intents requires intent_v1")
+            return frozenset()
+        if "intents" not in payload:
+            return QUEST_CORE_INTENTS
+        names = payload["intents"]
+        if not isinstance(names, list) or any(
+            not isinstance(name, str) or QUEST_INTENT_NAME_PATTERN.fullmatch(name) is None
+            for name in names
+        ):
+            raise ValueError("intents must be a list of valid field names")
+        declared = frozenset(names)
+        if len(declared) != len(names) or not QUEST_CORE_INTENTS.issubset(declared):
+            raise ValueError("intents must be unique and include all core fields")
+        return declared
 
-        Returns:
-            True 表示可作为合法输入交给上层。
+    @staticmethod
+    def _normalize_pose_payload(
+        payload: Dict[str, Any], intent_v1: bool = False,
+        declared_intents: Optional[FrozenSet[str]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """校验并返回规范化后的新字典；无效帧返回 None，不修改入参。
+
+        必需字段严格校验；可选字段保留旧别名、缩放、截断和不可转换值归零语义。
         """
         if "type" in payload:
-            return False
+            return None
+        if intent_v1:
+            declared = QUEST_CORE_INTENTS if declared_intents is None else declared_intents
+            for name, field in QUEST_INTENT_FIELDS.items():
+                if name not in declared:
+                    continue
+                value = payload.get(name)
+                if field.value_type == "event":
+                    if not QuestTcpReceiver._is_strict_int(value) or value < 0:
+                        return None
+                elif field.value_type == "vector2":
+                    if (not isinstance(value, list) or len(value) != 2 or any(
+                            isinstance(item, bool) or not isinstance(item, (int, float))
+                            or not math.isfinite(item) or not -1 <= item <= 1
+                            for item in value)):
+                        return None
+                elif (
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or not 0 <= value <= 1
+                    or (field.value_type == "toggle" and value not in (0, 1))
+                ):
+                    return None
         timestamp = payload.get("ts")
         frame_index = payload.get("fi")
         if (
@@ -228,8 +327,9 @@ class QuestTcpReceiver:
             or not isinstance(frame_index, (int, float))
             or not math.isfinite(frame_index)
             or int(frame_index) != frame_index
+            or frame_index < 0
         ):
-            return False
+            return None
 
         validity = {}
         for key in ("rpv", "lpv"):
@@ -240,7 +340,7 @@ class QuestTcpReceiver:
                 or not math.isfinite(value)
                 or value not in (0, 1)
             ):
-                return False
+                return None
             validity[key] = value == 1
 
         right_keys = {"px", "py", "pz", "qx", "qy", "qz", "qw"}
@@ -251,7 +351,7 @@ class QuestTcpReceiver:
             or not left_keys.issubset(payload)
             or prefixed_right_keys.intersection(payload)
         ):
-            return False
+            return None
         required_keys = right_keys | left_keys
         if any(
             isinstance(payload[key], bool)
@@ -259,14 +359,32 @@ class QuestTcpReceiver:
             or not math.isfinite(payload[key])
             for key in required_keys
         ):
-            return False
+            return None
 
-        right_norm_sq = sum(float(payload[f"q{axis}"]) ** 2 for axis in "xyzw")
-        left_norm_sq = sum(float(payload[f"lq{axis}"]) ** 2 for axis in "xyzw")
-        return (
-            (not validity["rpv"] or right_norm_sq > 1e-24)
-            and (not validity["lpv"] or left_norm_sq > 1e-24)
-        )
+        right_norm = math.sqrt(sum(float(payload[f"q{axis}"]) ** 2 for axis in "xyzw"))
+        left_norm = math.sqrt(sum(float(payload[f"lq{axis}"]) ** 2 for axis in "xyzw"))
+        if not (
+            (not validity["rpv"] or right_norm > 1e-12)
+            and (not validity["lpv"] or left_norm > 1e-12)
+        ):
+            return None
+
+        normalized = payload.copy()
+        normalized["x"] = bool(payload.get("x", payload.get("lta", 0)))
+        normalized["y"] = bool(payload.get("y", payload.get("ltb", 0)))
+        normalized["menu"] = bool(payload.get("menu", payload.get("lmb", 0)))
+        normalized["a"] = bool(payload.get("a", payload.get("rta", 0)))
+        normalized["b"] = bool(payload.get("b", payload.get("rgbtn", payload.get("rtb2", 0))))
+        for key in ("lrb", "rtb", "rgb"):
+            normalized[key] = bool(payload.get(key, 0))
+        try:
+            for key in ("lt", "lg", "rt", "rg"):
+                normalized[key] = _analog_value(payload.get(key, 0.0), 0)
+            for key in ("lsx", "lsy", "rsx", "rsy"):
+                normalized[key] = _analog_value(payload.get(key, 0.0), -127)
+        except (ValueError, OverflowError):
+            return None
+        return normalized
 
     def _send_protocol_error(self, code: str) -> bool:
         """把一条 protocol_error 控制帧入队。"""
@@ -325,11 +443,14 @@ class QuestTcpReceiver:
                 self.disconnect_notified = False
                 self.protocol_state = "Negotiating"
                 self.protocol_version = None
+                self.capabilities = frozenset()
+                self._declared_intents = frozenset()
                 self.connection_id = None
                 self.client_id = None
                 self.connection_negotiated = False
                 self.last_valid_rx_monotonic = time.monotonic()
                 self.last_heartbeat_seq = None
+                self.last_request_id = None
                 self.handshake_event.clear()
                 self.first_frame_event.clear()
                 self._clear_send_queue()
@@ -402,36 +523,70 @@ class QuestTcpReceiver:
                                 or not payload.get("app_version")
                                 or not self._is_strict_int(payload.get("connection_seq"))
                                 or payload.get("connection_seq") <= 0
+                                or (
+                                    "capabilities" in payload
+                                    and (
+                                        not isinstance(payload["capabilities"], list)
+                                        or any(
+                                            not isinstance(item, str) or not item
+                                            for item in payload["capabilities"]
+                                        )
+                                    )
+                                )
                             ):
+                                self._send_protocol_error("invalid_hello")
+                                close_reason = "quest_protocol_error"
+                                break
+                            capabilities = frozenset(payload.get("capabilities", []))
+                            try:
+                                declared_intents = self._parse_declared_intents(payload, capabilities)
+                            except ValueError:
                                 self._send_protocol_error("invalid_hello")
                                 close_reason = "quest_protocol_error"
                                 break
                             self.client_id = payload["client_id"]
                             self.protocol_version = QUEST_PROTOCOL_VERSION
+                            self.capabilities = capabilities
+                            self._declared_intents = declared_intents
                             self.connection_id = str(uuid.uuid4())
                             if not self._queue_control({
                                 "type": "hello_ack",
                                 "protocol": QUEST_PROTOCOL_VERSION,
                                 "connection_id": self.connection_id,
+                                "capabilities": sorted(
+                                    capabilities.intersection(QUEST_SUPPORTED_CAPABILITIES)
+                                ),
                             }):
                                 close_reason = "quest_send_failed"
                                 break
+                            unknown_intents = declared_intents.difference(QUEST_INTENT_FIELDS)
+                            if unknown_intents:
+                                logging.info("[QuestTcpReceiver] Ignoring unknown intent fields: %s",
+                                             sorted(unknown_intents))
                             negotiated = True
                             self.connection_negotiated = True
                             self.last_valid_rx_monotonic = now
                             self.protocol_state = "Healthy"
                             self.handshake_event.set()
+                            if self.negotiated_callback:
+                                try:
+                                    self.negotiated_callback(self, generation)
+                                except Exception:
+                                    logging.exception("[QuestTcpReceiver] Negotiation callback failed")
                             self._notify_status("Healthy", generation)
                             continue
 
                         if not is_control:
-                            if not self._is_valid_pose_payload(payload):
+                            normalized = self._normalize_pose_payload(
+                                payload, self.intent_v1_enabled, self.declared_intents,
+                            )
+                            if normalized is None:
                                 self._send_protocol_error("invalid_pose_frame")
                                 close_reason = "quest_protocol_error"
                                 break
                             self.last_valid_rx_monotonic = now
                             try:
-                                self.frame_callback(payload, generation)
+                                self.frame_callback(normalized, generation)
                             except Exception:
                                 logging.exception("[QuestTcpReceiver] Invalid Quest pose callback")
                                 self._send_protocol_error("invalid_pose_frame")
@@ -458,6 +613,26 @@ class QuestTcpReceiver:
                             if not self._queue_control({"type": "heartbeat_ack", "seq": seq}):
                                 close_reason = "quest_send_failed"
                                 break
+                            continue
+                        if record_type in {"connect", "initialize", "stop", "param_set"}:
+                            if not self.session_setup_v1_enabled:
+                                self._send_protocol_error("invalid_control_record")
+                                close_reason = "quest_protocol_error"
+                                break
+                            request_id = payload.get("request_id")
+                            if not self._is_strict_int(request_id) or request_id <= 0:
+                                self._send_protocol_error("invalid_control_record")
+                                close_reason = "quest_protocol_error"
+                                break
+                            if self.last_request_id is not None and request_id <= self.last_request_id:
+                                # 请求重放/乱序不影响连接，且不产生回复。
+                                continue
+                            self.last_request_id = request_id
+                            if self.control_callback:
+                                try:
+                                    self.control_callback(payload, self, generation)
+                                except Exception:
+                                    logging.exception("[QuestTcpReceiver] Control callback failed")
                             continue
                         if record_type in {"hello", "hello_ack", "heartbeat_ack", "protocol_error", "session_end"}:
                             self._send_protocol_error("invalid_control_record")

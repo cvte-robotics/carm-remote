@@ -2,6 +2,8 @@
 
 本文面向需要为遥操链路接入新末端设备的开发者，说明末端实现的扩展合同、加载方式、调用时机和验证方法。
 
+源码版本与适用范围见 [整体架构](ARCHITECTURE.md)。
+
 ## 1. 扩展边界
 
 末端实现位于 `server/basic/joystick/end_effectors/`。启动参数 `--end-effector <name>` 选择一个实现；系统为每个 `ArmRuntime` 创建一个实例，并向它提供当前机械臂连接、绑定手侧和主从臂角色。
@@ -45,21 +47,24 @@
 5. 实现 `set_eff(trigger)`，返回严格的布尔值。
 
    ```python
+   import math
    from . import EndEffectorBase, EndEffectorContext
 
    class VacuumEffector(EndEffectorBase):
        NAME = "vacuum"
 
-        def __init__(self, context: EndEffectorContext, **options):
+       def __init__(self, context: EndEffectorContext, **options):
            super().__init__(context, **options)
            self._sdk = context.carm
 
        def set_eff(self, trigger):
-           if not isinstance(trigger, (int, float)):
+           if isinstance(trigger, bool) or not isinstance(trigger, (int, float)):
+               return False
+           if not math.isfinite(trigger):
                return False
            value = max(0, min(127, int(trigger)))
-           self._sdk.send_end_effector(value)
-           return True
+           # 替换为设备自己的只发不等接口；此处名称仅为示意，并非 Carm SDK 方法。
+           return self._sdk.send_end_effector_nowait(value) is True
    ```
 
 名称会转为小写，并且必须匹配 `[a-z][a-z0-9_]*`。以下名称合法：`vacuum`、`two_finger`；`two-finger`、`2finger` 不合法。
@@ -71,6 +76,7 @@
 ```
 
 `EndEffectorContext` 提供：
+
 | 字段 | 含义 |
 |---|---|
 | `carm` | 当前 `ArmRuntime` 已建立连接的 Carm 实例 |
@@ -85,12 +91,14 @@
 
 控制循环把 provider 归一化的 trigger 值传给 `set_eff()`。Quest 当前使用 `0..127`；实现仍应自行检查类型、有限性并钳制或拒绝越界值，不能假设未来输入源一定提供合法值。
 
-末端命令只在 `track_pose()` 返回严格的 `True` 且连接身份仍有效后提交。Host 用每臂一个 `AsyncEndEffectorSender`（`server/basic/joystick/session/end_effector_sender.py`）包装末端实例：控制循环只把最新 trigger 放入单槽，不等待 SDK 应答；`set_eff()` 在该发送器的独立线程中被调用，同一实例不会被并发调用。发送规则：
+位姿控制路径在位姿派发成功、连接身份复核通过后提交末端值。Host 用每臂一个 `EndEffectorSender`（`server/basic/joystick/session/end_effector_sender.py`）包装末端实例；`set_eff()` 直接在所属臂的控制线程中调用，同一实例不会被并发调用，也没有独立的末端 worker 或待发队列。发送规则：
 
 - trigger 与上次成功发送的值不同时发送。
 - 值相同时，距上次成功发送不足 0.5 秒则跳过，超过 0.5 秒才再次发送（保活）。
 - 上次未被接受或抛出异常时，下一次提交必定重新发送。
-- 停止、回零或控制循环异常时丢弃尚未发送的值；回零和断开前等待正在进行的 `set_eff()` 结束。
+- 控制中止时使去重基线失效；停止 sender 前先等待所属控制线程退出，停止后不再接受提交。
+
+**`set_eff()` 必须及时返回，不能在控制周期内同步等待 SDK 回包、等待硬件到位、休眠或执行长时间 I/O。** 末端、位姿与臂型角共用本臂控制线程；阻塞末端实现会直接拖慢这些功能。原生 `carm` 实现在 `sdk_nowait()` 作用域内调用 SDK `set_eeff()`，透传实现使用当前 Carm 适配器的 `send_only()`；两者只确认命令已写入连接，控制器是否接受或完成动作需另行确认。
 
 因此 `set_eff()` 的调用次数少于控制循环的步数，实现不应依赖“每个控制周期调用一次”。其返回值和异常按 best-effort 处理：
 
@@ -106,15 +114,13 @@ class MyEndEffector(EndEffectorBase):
 
     def set_eff(self, trigger):
         try:
-            self._sdk.send_channel_a(int(trigger))
-            self._sdk.send_channel_b(int(trigger))
-            return True
+            # 示意：设备实现需提供只发不等接口，且返回值必须表达写入结果。
+            return self._sdk.send_channel_a_nowait(int(trigger)) is True
         except Exception:
-            # 每个通道单独处理异常，不要让一个失败阻止其他通道继续发送
             return False
 ```
 
-当前合同没有 `start`、`stop` 或 `close` 生命周期钩子。异步发送线程由 Host 统一持有，实现本身应保持轻量，避免再创建 worker、队列、后台线程或需要单独释放的外部资源；若新设备必须拥有这类资源，应先扩展并验证统一生命周期合同，而不是只在新模块中隐式持有资源。
+当前合同没有 `start`、`stop` 或 `close` 生命周期钩子。实现本身应保持轻量，避免创建 worker、队列、后台线程或需要单独释放的外部资源；若新设备必须拥有这类资源，应先扩展并验证统一生命周期合同，而不是只在新模块中隐式持有资源。
 
 ```python
 # 推荐：保持实现轻量，不在模块顶层创建后台线程或持久队列
@@ -162,7 +168,7 @@ class MyEndEffector(EndEffectorBase):
 1. 发现检查：`EndEffectorBase.load_all()` 的结果包含新名称。
 2. 构造检查：使用假的 Carm 对象分别构造需要支持的 `side` 和 `role`。
 3. 输入检查：覆盖 `0`、`127`、越界值、布尔值、非数值和非有限数值。
-4. 派发检查：确认一次 `set_eff()` 产生预期的 SDK 调用、参数和调用次数。
+4. 派发检查：确认一次 `set_eff()` 产生预期的 SDK 调用、参数和调用次数，并确认不会等待回包或设备到位而阻塞控制线程。
 5. 失败检查：确认 SDK 返回失败或抛出异常时，行为符合该实现声明的 best-effort 或拒绝策略。
 6. 启动检查：分别通过 Windows 或 Linux 根启动脚本选择新名称，确认 Qt 和后端使用同一实现。
 7. 设备验收：在可控环境验证左右侧、单臂和双臂，以及停止、断连和重新初始化后的物理行为。

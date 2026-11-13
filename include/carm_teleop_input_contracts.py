@@ -1,8 +1,9 @@
 """遥操作 Host 与各输入源模块共享的中立契约（不含任何 provider 依赖）。
 
 只定义数据类型、policy 协议、事件 sink 与模块协议；跨线程传递对象一律 frozen
-dataclass 并在 ``__post_init__`` 校验。领域术语保持英文原词：lease、epoch、token、
-frame、jump、rebase、policy、pose、TCP、ADB、SSE。
+dataclass；输入数值由 provider 边界校验，样本和 Host 内部对象不重复校验。
+批次只校验中立结构，生命周期配置仍在构造时校验。领域术语保持英文原词：lease、epoch、frame、
+jump、rebase、policy、pose、TCP、ADB、SSE。
 """
 
 from dataclasses import dataclass
@@ -177,34 +178,6 @@ class ControlAction(Enum):
     MOVE_JOINT = "move_joint"
 
 
-class ControlOutcome(Enum):
-    """Host 完成一次控制尝试后回报的事实。"""
-
-    REBASE_APPLIED = "rebase_applied"
-    DISPATCH_COMMITTED = "dispatch_committed"
-    DISPATCH_REJECTED = "dispatch_rejected"
-    STALE = "stale"
-
-
-@dataclass(frozen=True)
-class RebasePayload:
-    """通用 Cartesian rebase 数据；token 身份在此保持不透明。"""
-
-    raw_pose: Tuple[float, ...]
-    reason: str = ""
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.raw_pose, tuple) or len(self.raw_pose) < 7:
-            raise ValueError("rebase payload pose must contain at least 7 values")
-        if any(
-            isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)
-            for value in self.raw_pose
-        ):
-            raise ValueError("rebase payload pose must be finite numbers")
-        if not isinstance(self.reason, str):
-            raise ValueError("rebase payload reason must be a string")
-
-
 @dataclass(frozen=True)
 class JointCommand:
     """由输入源 policy 产出的、可被 Host 直接执行的单条关节命令。"""
@@ -342,45 +315,14 @@ class ArmProfile:
 
 
 @dataclass(frozen=True)
-class ControlDecision:
-    """policy 对单次控制采样的决策结果。
-
-    ``source_token`` 是该决策绑定的输入帧身份，Host 只原样冻结并在
-    validate_dispatch/complete_control 时回传，不解释其内容；``rebase_payload``
-    与 ``command`` 分别对应 REBASE 与关节命令两种动作。
-    """
-
-    action: ControlAction
-    source_token: Optional[object]
-    reason: str = ""
-    rebase_payload: Optional[object] = None
-    command: Optional[JointCommand] = None
-
-
-@dataclass(frozen=True)
-class ControlResult:
-    """Host 回报控制结果后，policy 复核得到的最终结果。"""
-
-    outcome: ControlOutcome
-    source_token: Optional[object]
-    reason: str = ""
-
-
-@dataclass(frozen=True)
 class ControlContext:
-    """
-Host 为单次 policy 决策冻结的样本。
-
-同一个 control_policy 实例的 decide_control/validate_dispatch/complete_control
-须串行化（Host 用自己的锁维持）；运动学 RPC 不得在持有 Host 锁时发起。
-"""
+    """关节输入 policy 在所属控制线程内使用的冻结样本。"""
 
     hand: str
     controller: object
     # Host 会话身份（``ActiveSourceBinding.session_id``）。
     session_id: int
-    # ``ControlParams.epoch``：yaw/scale 参数的发布 epoch。其它失效事件都由冻结的
-    # binding 身份或 Host 控制 epoch 承载，因此不需要单独的 controller generation。
+    # ``ControlParams.epoch``：yaw/scale 参数的发布 epoch。
     params_epoch: int
     bound_active: bool
     need_sync_feedback: bool
@@ -393,50 +335,21 @@ Host 为单次 policy 决策冻结的样本。
     now_pose: Optional[Tuple[float, ...]] = None
     lease: Optional["SourceLease"] = None
     arm_connection_generation: Optional[int] = None
-
-
-@dataclass(frozen=True)
-class PolicyDispatchContext:
-    """Host 一次派发尝试的冻结身份。
-
-    ``source_token`` 就是 ControlDecision 携带的原始对象；``require_current_frame``
-    区分发送前（必须仍是当前帧）与发送后（允许更新的普通帧已到达）两种校验。
-    """
-
-    hand: str
-    controller: object
-    source_token: object
-    session_id: int
-    params_epoch: int
-    require_current_frame: bool = True
-
-
-@dataclass(frozen=True)
-class ControlCompletion:
-    """Host 派发结束后的回报：原尝试身份与其实际结果。"""
-
-    context: PolicyDispatchContext
-    result: ControlResult
+    discontinuity_seq: int = 0
 
 
 class SourceControlPolicy(Protocol):
     """输入源 adapter 与 joystick Host 之间的 policy 缝。"""
 
-    def decide_control(self, context: ControlContext) -> ControlDecision:
-        """
-在 Host 冻结的样本上做一次决策（可推进 policy 状态，决策与样本一一对应）。
-
-Args:
-    context: Host 冻结的样本。
-
-Returns:
-    决策，含 action、source token 以及可选的 rebase payload / 关节命令。
-"""
+    def compute_joint_command(
+        self, context: ControlContext,
+    ) -> Optional[Tuple[ControlAction, JointCommand]]:
+        """在所属臂的控制线程内计算关节命令；无命令时返回 None。"""
         ...
 
     def needs_kinematics(self, context: ControlContext) -> bool:
         """
-声明本次决策是否需要 Host 计算正运动学（须轻量、无副作用）。
+声明本次关节计算是否需要 Host 计算正运动学（须轻量、无副作用）。
 
 返回 True 时 Host 在锁外计算 FK 并作为第二个 ControlContext 的 ``plan_pose`` /
 ``now_pose`` 送回；否则这两个字段为 None。
@@ -446,39 +359,6 @@ Returns:
     def get_reengage_status(self, hand: str) -> Optional[ReengageStatus]:
         """返回单手不可变再接入观察；无观察时返回 None。"""
         ...
-
-    def validate_dispatch(self, context: PolicyDispatchContext) -> bool:
-        """在 Host 真正下发命令前复核冻结的尝试是否仍然有效。
-
-        Args:
-            context: 冻结的派发尝试（token、session、epoch 与帧新鲜度要求）。
-
-        Returns:
-            True 表示可以下发；False 表示必须丢弃这次尝试。
-        """
-        ...
-
-    def complete_control(self, completion: ControlCompletion) -> ControlResult:
-        """Host 下发结束后回报结果，由 policy 判定提交还是过期。
-
-        Args:
-            completion: 原尝试身份与 Host 的实际结果。
-
-        Returns:
-            policy 复核后的最终结果；可能把成功改写为 STALE。
-        """
-        ...
-
-
-class BaseSourceControlPolicy:
-    """只实现可选观察与运动学需求；控制准入必须由具体 policy 实现。"""
-
-    def needs_kinematics(self, context: ControlContext) -> bool:
-        return False
-
-    def get_reengage_status(self, hand: str) -> Optional[ReengageStatus]:
-        return None
-
 
 @dataclass(frozen=True)
 class ConnectResult:
@@ -510,7 +390,7 @@ class ConnectResult:
 class PoseSample:
     """一帧手部/TCP 位姿采样（位置 + 四元数 + 时间戳）。
 
-    速度/加速度字段必须是三元 tuple；参与 jump 检测时四元数会先归一化。
+    由 provider 边界保证有限数值与三元 tuple；参与 jump 检测时四元数会先归一化。
     """
 
     x: float
@@ -526,36 +406,14 @@ class PoseSample:
     angular_velocity: Tuple[float, float, float] = (0.0, 0.0, 0.0)
     acceleration: Tuple[float, float, float] = (0.0, 0.0, 0.0)
 
-    def __post_init__(self) -> None:
-        vector_values = (
-            self.linear_velocity,
-            self.angular_velocity,
-            self.acceleration,
-        )
-        if any(not isinstance(vector, tuple) for vector in vector_values):
-            raise ValueError("pose vectors must be immutable tuples")
-        if any(len(vector) != 3 for vector in vector_values):
-            raise ValueError("pose vectors must contain exactly three values")
-        values = (
-            self.x, self.y, self.z, self.qx, self.qy, self.qz, self.qw,
-            self.timestamp, self.confidence, *self.linear_velocity,
-            *self.angular_velocity, *self.acceleration,
-        )
-        if any(
-            isinstance(value, bool)
-            or not isinstance(value, (int, float))
-            or not math.isfinite(value)
-            for value in values
-        ):
-            raise ValueError("pose sample values must be finite numbers")
-
 
 @dataclass(frozen=True)
 class ButtonSample:
-    """一帧按钮/摇杆采样。
+    """一帧原始按钮/摇杆采样，仅供观测，不承载控制功能。
 
     ``trigger``/``grip`` 是 0..127 的模拟量，``joystick_x``/``joystick_y`` 是
     -127..127 的摇杆轴；``btn_menu`` 与 ``menu_capture`` 同源，都表示菜单键状态。
+    数值与标志类型由 provider 边界保证，构造时不重复校验。
     """
 
     trigger: int
@@ -571,34 +429,79 @@ class ButtonSample:
     reserve: int
     timestamp: float
 
+
+@dataclass(frozen=True)
+class HandIntentSample:
+    """单手功能结果；home_sequence 在同一 lease 内单调不减。"""
+
+    motion_engaged: bool
+    rotation_locked: bool
+    end_effector: int
+    home_sequence: int
+    timestamp: float
+    arm_angle_stick: Tuple[float, float] = (0.0, 0.0)
+
     def __post_init__(self) -> None:
-        integer_values = (self.trigger, self.grip, self.reserve)
-        if any(isinstance(value, bool) or not isinstance(value, int) for value in integer_values):
-            raise ValueError("button integer fields must be non-bool integers")
-        bool_values = (
-            self.btn_xa,
-            self.btn_yb,
-            self.btn_menu,
-            self.btn_system,
-            self.menu_capture,
-        )
-        if any(not isinstance(value, bool) for value in bool_values):
-            raise ValueError("button flag fields must be booleans")
-        numeric_values = (
-            self.timestamp,
-        )
-        if any(
-            isinstance(value, bool)
-            or not isinstance(value, (int, float))
-            or not math.isfinite(value)
-            for value in numeric_values
-        ):
-            raise ValueError("button timestamp must be a finite number")
-        axis_values = (self.joystick_x, self.joystick_y)
-        if any(isinstance(value, bool) or not isinstance(value, int) for value in axis_values):
-            raise ValueError("button joystick axes must be non-bool integers")
-        if not isinstance(self.joystick_z, bool):
-            raise ValueError("button joystick_z must be a boolean")
+        if any(not isinstance(value, bool) for value in
+               (self.motion_engaged, self.rotation_locked)):
+            raise ValueError("intent flags must be booleans")
+        if (isinstance(self.end_effector, bool) or not isinstance(self.end_effector, int)
+                or not 0 <= self.end_effector <= 127):
+            raise ValueError("intent end_effector must be an integer in 0..127")
+        if (isinstance(self.home_sequence, bool) or not isinstance(self.home_sequence, int)
+                or self.home_sequence < 0):
+            raise ValueError("intent home_sequence must be a non-negative integer")
+        if (isinstance(self.timestamp, bool) or not isinstance(self.timestamp, (int, float))
+                or not math.isfinite(self.timestamp)):
+            raise ValueError("intent timestamp must be a finite number")
+        if (not isinstance(self.arm_angle_stick, tuple) or len(self.arm_angle_stick) != 2
+                or any(isinstance(value, bool) or not isinstance(value, (int, float))
+                       or not math.isfinite(value) or not -1 <= value <= 1
+                       for value in self.arm_angle_stick)):
+            raise ValueError("intent arm_angle_stick must be two finite values in [-1, 1]")
+
+
+@dataclass(frozen=True)
+class WaistControlSample:
+    """腰控制输入；模式为头盔或摇杆，失效或重定位后消费者需重建基线。"""
+
+    mode: str
+    head: PoseSample
+    head_valid: bool
+    recenter_count: int
+
+    def __post_init__(self) -> None:
+        if self.mode not in ("head", "stick"):
+            raise ValueError("腰控制方式必须是 head 或 stick")
+        if not isinstance(self.head, PoseSample):
+            raise ValueError("头盔位姿必须是 PoseSample")
+        if not isinstance(self.head_valid, bool):
+            raise ValueError("头盔有效标志必须是布尔值")
+        if type(self.recenter_count) is not int or self.recenter_count < 0:
+            raise ValueError("重定位次数必须是非负整数")
+
+
+@dataclass(frozen=True)
+class BodyIntentSample:
+    """机身功能结果；事件序号与腰摇杆值在同一 lease 内发布。"""
+
+    waist_follow_sequence: int
+    waist_home_sequence: int
+    waist_stick: Tuple[float, float]
+    timestamp: float
+
+    def __post_init__(self) -> None:
+        if any(type(value) is not int or value < 0 for value in
+               (self.waist_follow_sequence, self.waist_home_sequence)):
+            raise ValueError("机身功能序号必须是非负整数")
+        if (not isinstance(self.waist_stick, tuple) or len(self.waist_stick) != 2
+                or any(isinstance(value, bool) or not isinstance(value, (int, float))
+                       or not math.isfinite(value) or not -1 <= value <= 1
+                       for value in self.waist_stick)):
+            raise ValueError("腰摇杆必须是两个 [-1, 1] 范围内的有限数值")
+        if (isinstance(self.timestamp, bool) or not isinstance(self.timestamp, (int, float))
+                or not math.isfinite(self.timestamp)):
+            raise ValueError("机身功能时间戳必须是有限数值")
 
 
 @dataclass(frozen=True)
@@ -606,7 +509,8 @@ class HandInputUpdate:
     """一次 batch 中单手位的输入更新。
 
     ``update_pose``/``update_button`` 表示本批是否携带对应数据，``pose_valid``
-    表示位姿本身是否有效：无效位姿不应被接受，但同批按钮仍可更新。
+    表示位姿本身是否有效：无效位姿不应被接受，但同批按钮及 intent 仍可更新。
+    ``intent`` 与 button 同生命周期，update_button 为真时两者都必须提供。
     """
 
     hand: str
@@ -615,21 +519,7 @@ class HandInputUpdate:
     pose_valid: bool
     update_button: bool
     button: Optional[ButtonSample]
-
-    def __post_init__(self) -> None:
-        if self.hand not in VALID_HANDS:
-            raise ValueError(f"unsupported hand: {self.hand}")
-        bool_values = (self.update_pose, self.pose_valid, self.update_button)
-        if any(not isinstance(value, bool) for value in bool_values):
-            raise ValueError("hand update control fields must be booleans")
-        if self.pose is not None and not isinstance(self.pose, PoseSample):
-            raise ValueError("hand update pose must be a PoseSample or None")
-        if self.button is not None and not isinstance(self.button, ButtonSample):
-            raise ValueError("hand update button must be a ButtonSample or None")
-        if self.update_pose and self.pose is None:
-            raise ValueError("pose is required when update_pose is true")
-        if self.update_button and self.button is None:
-            raise ValueError("button is required when update_button is true")
+    intent: Optional[HandIntentSample] = None
 
 
 @dataclass(frozen=True)
@@ -705,7 +595,7 @@ class JointInputBatch:
 
 @dataclass(frozen=True)
 class UnifiedHandSample:
-    """provider 专有事件组装完成后的一次 Host 控制采样。"""
+    """provider 专有事件组装完成后的一次 Host 控制采样，不复查已校验输入。"""
     hand: str
     pose: Optional[PoseSample]
     button: Optional[ButtonSample]
@@ -716,21 +606,7 @@ class UnifiedHandSample:
     provider_id: str
     source_generation: int
     atomic: bool
-
-    def __post_init__(self) -> None:
-        if self.hand not in VALID_HANDS or not isinstance(self.provider_id, str):
-            raise ValueError("unified sample identity is invalid")
-        if self.pose is not None and not isinstance(self.pose, PoseSample):
-            raise ValueError("unified sample pose is invalid")
-        if self.button is not None and not isinstance(self.button, ButtonSample):
-            raise ValueError("unified sample button is invalid")
-        if not isinstance(self.pose_valid, bool) or not isinstance(self.atomic, bool):
-            raise ValueError("unified sample flags are invalid")
-        if any(isinstance(value, bool) or not isinstance(value, int) or value < 0
-               for value in (self.input_sequence, self.source_frame_id, self.source_generation)):
-            raise ValueError("unified sample sequence is invalid")
-        if not isinstance(self.timestamp, (int, float)) or not math.isfinite(self.timestamp):
-            raise ValueError("unified sample timestamp is invalid")
+    intent: Optional[HandIntentSample] = None
 
 
 @dataclass(frozen=True)
@@ -738,7 +614,9 @@ class RawInputBatch:
     """一个 lease 下一次传输批次的原始输入（可只含单手或同时含双手）。
 
     ``atomic_batch`` 为 True 表示本批双手数据来自同一帧、必须整体接受或整体拒绝
-    （Quest 即此语义）；``batch_sequence`` 是 provider 自己的帧序号。
+    （Quest 即此语义）；``batch_sequence`` 由 provider 边界保证为非负整数，
+    ``transport_generation`` 由连接 owner 生成。这里只检查中立批次结构。
+    ``waist_input`` 与 ``body_intent`` 是批次级扩展，缺失时为 None。
     """
 
     lease: SourceLease
@@ -746,22 +624,22 @@ class RawInputBatch:
     batch_sequence: int
     atomic_batch: bool
     hands: Tuple[HandInputUpdate, ...]
+    waist_input: Optional[WaistControlSample] = None
+    body_intent: Optional[BodyIntentSample] = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.lease, SourceLease):
             raise ValueError("input batch lease is required")
+        if self.waist_input is not None and not isinstance(self.waist_input, WaistControlSample):
+            raise ValueError("批次腰输入必须是 WaistControlSample 或 None")
+        if self.body_intent is not None and not isinstance(self.body_intent, BodyIntentSample):
+            raise ValueError("批次机身功能必须是 BodyIntentSample 或 None")
         if not isinstance(self.atomic_batch, bool):
             raise ValueError("atomic_batch must be a boolean")
         if not isinstance(self.hands, tuple) or any(
             not isinstance(update, HandInputUpdate) for update in self.hands
         ):
             raise ValueError("input batch hands must be a tuple of HandInputUpdate")
-        for name, value in (
-            ("transport_generation", self.transport_generation),
-            ("batch_sequence", self.batch_sequence),
-        ):
-            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-                raise ValueError(f"{name} must be a non-negative integer")
         hand_names = tuple(update.hand for update in self.hands)
         if len(set(hand_names)) != len(hand_names):
             raise ValueError("an input batch may update each hand at most once")
@@ -783,22 +661,6 @@ class InputUpdateDecision:
     invalidate_controller: bool
     reject_controller: bool
     details: Tuple[Tuple[str, ScalarValue], ...] = ()
-
-    def __post_init__(self) -> None:
-        if self.hand not in VALID_HANDS:
-            raise ValueError(f"unsupported hand: {self.hand}")
-        if any(
-            not isinstance(value, bool)
-            for value in (
-                self.accept_pose,
-                self.accept_button,
-                self.invalidate_controller,
-                self.reject_controller,
-            )
-        ):
-            raise ValueError("input decision flags must be booleans")
-        if not isinstance(self.details, tuple):
-            raise ValueError("input decision details must be immutable")
 
 
 @dataclass(frozen=True)
@@ -979,21 +841,15 @@ class BaseInputSourceModule:
     绑定族。
     """
 
-    # 重连缝：仅能力位开启时被调用；默认不安排宽限，调用方忽略返回值。
-    def cancel_reconnect_timer(self, clear_deadline: bool = False) -> None:
-        """默认无重连定时器可取消。"""
-        return None
-
-    def begin_reconnect_grace(self, lease, evaluate_recovery, expire) -> bool:
-        """默认不进入宽限期，返回 False 让 Host 立即终结会话。"""
-        return False
+    # 重连宽限长度由支持该能力的 provider 声明，截止时间由 Host 持有。
+    reconnect_grace_seconds: float
 
     # controller 绑定族：仅能力位开启时被调用。
-    def bind_controller(self, *args) -> Optional[object]:
+    def bind_controller(self, hand: str, controller: object) -> Optional[object]:
         """默认等价于“无上一控制器可失效”。"""
         return None
 
-    def release_controller(self, *args) -> bool:
+    def release_controller(self, hand: str, controller: object) -> bool:
         """True 保持 Host 的“非参与模块”分支：失效映射且不回溯控制代次。"""
         return True
 
@@ -1003,10 +859,6 @@ class BaseInputSourceModule:
 
     def owned_controllers(self):
         """默认不持有任何 controller。"""
-        return ()
-
-    def on_mapping_change(self, *args):
-        """默认无绑定可失效，返回空集合。"""
         return ()
 
     def mark_input_disconnected(self):
@@ -1035,12 +887,12 @@ class BaseInputSourceModule:
 class InputSourceModule(Protocol):
     """Host 使用的模块生命周期协议；必需方法对每个输入源都会被调用。
 
-    可选缝由 BaseInputSourceModule 保证存在；control_policy 条目按 ControlContext
-    文档所述串行化。
+    可选缝由 BaseInputSourceModule 保证存在；关节 ``control_policy`` 只在所属控制
+    线程内调用。
     """
 
     module_id: str
-    control_policy: SourceControlPolicy
+    control_policy: Optional[SourceControlPolicy]
     arm_profile: Optional[ArmProfile]
 
     def current_lease(self) -> Optional[SourceLease]:
@@ -1100,19 +952,15 @@ class InputSourceModule(Protocol):
         """判断回调携带的 lease/传输实例是否仍是当前实例。"""
         ...
 
-    def cancel_reconnect_timer(self, clear_deadline: bool = False) -> None:
-        """取消重连定时器；clear_deadline 为 True 时同时清除截止时间。"""
-        ...
-
     def reset_policy(self) -> None:
         """把 control policy 重置回初始状态。"""
         ...
 
-    def bind_controller(self, *args) -> Optional[object]:
+    def bind_controller(self, hand: str, controller: object) -> Optional[object]:
         """绑定 controller，返回被替换掉的旧 controller。"""
         ...
 
-    def release_controller(self, *args) -> bool:
+    def release_controller(self, hand: str, controller: object) -> bool:
         """解绑 controller；False 表示当前绑定与传入 controller 不符。"""
         ...
 
@@ -1124,10 +972,6 @@ class InputSourceModule(Protocol):
         """返回本模块当前持有的全部 controller。"""
         ...
 
-    def on_mapping_change(self, *args):
-        """映射（mode/master_side/手位）变化时使相关绑定失效。"""
-        ...
-
     def mark_input_disconnected(self):
         """输入断链时使所有绑定失效。"""
         ...
@@ -1136,6 +980,6 @@ class InputSourceModule(Protocol):
         """校验 batch 是否属于本源且有原子性保证；不合法时抛 ValueError。"""
         ...
 
-    def process_input_batch(self, batch: RawInputBatch, *args):
+    def process_input_batch(self, batch: RawInputBatch, bound_hands):
         """把 batch 转换为逐手 InputUpdateDecision。"""
         ...

@@ -3,6 +3,7 @@
 import math
 
 from . import EndEffectorBase, EndEffectorContext
+from ..runtime.dependencies import sdk_nowait
 
 
 class CarmEndEffector(EndEffectorBase):
@@ -89,7 +90,8 @@ class CarmEndEffector(EndEffectorBase):
         """把 provider 归一化 trigger 映射为 Carm 原生位置并下发。
 
         Args: trigger 为 provider 归一化后的触发值（按 0-127 归一化）。
-        Returns: SDK 确认下发成功时为 True；法兰或 0 自由度配置直接返回 True。
+        Returns: 已写入连接时为 True（只发不等，控制器拒绝经状态帧错误上报）；
+            法兰或 0 自由度配置直接返回 True。
         Raises: ValueError trigger 非数值或非有限值。
         """
         if self._type == "flange" or self._dof == 0:
@@ -104,9 +106,10 @@ class CarmEndEffector(EndEffectorBase):
             upper - ratio * (upper - lower)
             for lower, upper in zip(self._lower, self._upper)
         ]
-        result = self.carm.set_eeff(
-            position,
-            list(self._velocity),
-            list(self._torque),
-        )
+        with sdk_nowait():
+            result = self.carm.set_eeff(
+                position,
+                list(self._velocity),
+                list(self._torque),
+            )
         return result is True or result == 1

@@ -28,6 +28,7 @@ REQUIRED_QUEST_FILES = (
 REQUIRED_REPOSITORY_FILES = (
     "config/joystick_config.json",
     "include/carm_teleop_input_contracts.py",
+    "include/carm_teleop_intent.py",
     "qt_app/main.py",
     "qt_app/app/__init__.py",
     "qt_app/app/backend_process.py",
@@ -51,7 +52,6 @@ REQUIRED_REPOSITORY_FILES = (
     "server/basic/joystick/core/pose_math.py",
     "server/basic/joystick/runtime/__init__.py",
     "server/basic/joystick/runtime/config.py",
-    "server/basic/joystick/runtime/context.py",
     "server/basic/joystick/runtime/dependencies.py",
     "server/basic/joystick/runtime/paths.py",
     "server/basic/joystick/session/__init__.py",
@@ -59,7 +59,6 @@ REQUIRED_REPOSITORY_FILES = (
     "server/basic/joystick/session/controller.py",
     "server/basic/joystick/session/state.py",
     "server/basic/joystick/sources/__init__.py",
-    "server/basic/joystick/sources/adapters.py",
     "server/basic/joystick/sources/registry.py",
 )
 
@@ -174,7 +173,7 @@ def validate() -> None:
         fail(f"Python 版本过低: {sys.version.split()[0]}，需要 >= {MIN_PYTHON[0]}.{MIN_PYTHON[1]}")
     if sys.version_info >= MAX_PYTHON:
         fail(f"Python 版本过高: {sys.version.split()[0]}，需要 < {MAX_PYTHON[0]}.{MAX_PYTHON[1]}")
-    for module, label in (("PyQt6.QtCore", "PyQt6 QtCore"), ("PyQt6.QtNetwork", "PyQt6 QtNetwork"), ("PyQt6.QtWidgets", "PyQt6 QtWidgets"), ("flask", "Flask"), ("werkzeug", "Werkzeug"), ("numpy", "NumPy"), ("scipy.spatial.transform", "SciPy Rotation"), ("websocket", "websocket-client"), ("zeroconf", "zeroconf")):
+    for module, label in (("PyQt6.QtCore", "PyQt6 QtCore"), ("PyQt6.QtNetwork", "PyQt6 QtNetwork"), ("PyQt6.QtWidgets", "PyQt6 QtWidgets"), ("flask", "Flask"), ("werkzeug", "Werkzeug"), ("websocket", "websocket-client"), ("zeroconf", "zeroconf")):
         check_import(module, label)
     check_carm()
     check_adb()
